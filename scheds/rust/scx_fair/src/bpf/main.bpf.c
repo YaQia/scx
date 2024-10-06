@@ -236,6 +236,15 @@ static u64 task_prio(struct task_struct *p)
 }
 
 /*
+ * Return the task's allowed lag: used to determine how early its deadline it
+ * can be.
+ */
+static u64 task_lag(struct task_struct *p)
+{
+	return slice_lag * task_prio(p) / 100;
+}
+
+/*
  * Return a value inversely proportional to the task's weight.
  */
 static inline u64 scale_inverse_fair(struct task_struct *p, u64 value)
@@ -248,6 +257,20 @@ static inline u64 scale_inverse_fair(struct task_struct *p, u64 value)
  */
 static inline u64 task_vtime(struct task_struct *p)
 {
+	u64 min_vruntime = vtime_now - task_lag(p);
+	struct task_ctx *tctx;
+
+	tctx = try_lookup_task_ctx(p);
+	if (!tctx)
+		return min_vruntime;
+
+	/*
+	 * Limit the vruntime to vtime_now minus the maximum task's lag to
+	 * avoid excessively penalizing tasks.
+	 */
+	if (vtime_before(p->scx.dsq_vtime, min_vruntime))
+		p->scx.dsq_vtime = min_vruntime;
+
 	return p->scx.dsq_vtime;
 }
 
@@ -454,7 +477,6 @@ out_put_cpumask:
  */
 static int dispatch_direct_cpu(struct task_struct *p, s32 cpu, u64 enq_flags)
 {
-	struct bpf_cpumask *offline;
 	u64 vtime = task_vtime(p);
 	u64 dsq_id = cpu_to_dsq(cpu);
 
@@ -514,7 +536,6 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx;
 	s32 cpu, prev_cpu = scx_bpf_task_cpu(p);
-	u64 vtime = task_vtime(p);
 
 	/*
 	 * During ttwu, the kernel may decide to skip ->select_task_rq() (e.g.,
@@ -541,7 +562,8 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Enqueue the task to the global DSQ. The task will be dispatched on
 	 * the first CPU that becomes available.
 	 */
-	scx_bpf_dispatch_vtime(p, shared_dsq_id, SCX_SLICE_DFL, vtime, enq_flags);
+	scx_bpf_dispatch_vtime(p, shared_dsq_id, SCX_SLICE_DFL,
+			       task_vtime(p), enq_flags);
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 
 	/*
@@ -663,22 +685,12 @@ void BPF_STRUCT_OPS(fair_running, struct task_struct *p)
 }
 
 /*
- * Return the task's allowed lag: used to determine how early its deadline it
- * can be.
- */
-static u64 task_lag(struct task_struct *p)
-{
-	return slice_lag * task_prio(p) / 100;
-}
-
-/*
  * Update task statistics when the task is releasing the CPU (either
  * voluntarily or because it expires its assigned time slice).
  */
 void BPF_STRUCT_OPS(fair_stopping, struct task_struct *p, bool runnable)
 {
-	u64 now = bpf_ktime_get_ns();
-	u64 lag = task_lag(p), slice, delta_t;
+	u64 now = bpf_ktime_get_ns(), slice, delta_t;
 	s32 cpu = scx_bpf_task_cpu(p);
 	struct cpu_ctx *cctx;
 	struct task_ctx *tctx;
@@ -687,24 +699,17 @@ void BPF_STRUCT_OPS(fair_stopping, struct task_struct *p, bool runnable)
 	if (cctx)
 		cctx->tot_runtime += now - cctx->last_running;
 
-	/*
-	 * Evaluate task's used time slice.
-	 */
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return;
 	tctx->select_cpu_done = false;
 
-	slice = MIN(p->se.sum_exec_runtime - tctx->sum_exec_runtime, slice_max);
-	slice = scale_inverse_fair(p, slice);
-	tctx->sum_exec_runtime = p->se.sum_exec_runtime;
-
 	/*
-	 * Re-align task's vruntime to the current global vruntime minus its
-	 * allowed lag, to prevent excessive prioritization of idling tasks.
+	 * Evaluate task's used time slice.
 	 */
-	if (vtime_before(p->scx.dsq_vtime, vtime_now - lag))
-		p->scx.dsq_vtime = vtime_now - lag;
+	slice = MIN(p->se.sum_exec_runtime - tctx->sum_exec_runtime, slice_max);
+	tctx->sum_exec_runtime = p->se.sum_exec_runtime;
+	slice = scale_inverse_fair(p, slice);
 
 	/*
 	 * Update task's vruntime by adding the used time slice, scaled by its
@@ -774,6 +779,11 @@ s32 BPF_STRUCT_OPS(fair_init_task, struct task_struct *p,
 	if (cpumask)
 		bpf_cpumask_release(cpumask);
 
+	tctx->sum_exec_runtime = p->se.sum_exec_runtime;
+	tctx->nvcsw = p->nvcsw;
+	tctx->nvcsw_ts = bpf_ktime_get_ns();
+	tctx->lat_weight = MIN(p->nvcsw * NSEC_PER_SEC / tctx->nvcsw_ts,
+			       MAX_LATENCY_WEIGHT);
 	return 0;
 }
 
