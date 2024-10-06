@@ -13,6 +13,8 @@ use serde::Serialize;
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
 pub struct Metrics {
+    #[stat(desc = "Number of kthread direct dispatches")]
+    pub nr_kthread_dispatches: u64,
     #[stat(desc = "Number of task direct dispatches")]
     pub nr_direct_dispatches: u64,
     #[stat(desc = "Number of task global dispatches")]
@@ -23,8 +25,9 @@ impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] dispatch -> direct: {:<5} shared: {:<5}",
+            "[{}] dispatch -> kthread: {:<5} direct: {:<5} shared: {:<5}",
             crate::SCHEDULER_NAME,
+            self.nr_kthread_dispatches,
             self.nr_direct_dispatches,
             self.nr_shared_dispatches
         )?;
@@ -33,6 +36,7 @@ impl Metrics {
 
     fn delta(&self, rhs: &Self) -> Self {
         Self {
+            nr_kthread_dispatches: self.nr_kthread_dispatches - rhs.nr_kthread_dispatches,
             nr_direct_dispatches: self.nr_direct_dispatches - rhs.nr_direct_dispatches,
             nr_shared_dispatches: self.nr_shared_dispatches - rhs.nr_shared_dispatches,
             ..self.clone()

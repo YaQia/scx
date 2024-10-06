@@ -25,22 +25,19 @@ const volatile u64 slice_min = 1ULL * NSEC_PER_MSEC;
 const volatile u64 slice_lag = 20ULL * NSEC_PER_MSEC;
 
 /*
- * When enabled always dispatch per-CPU kthreads directly on their CPU DSQ.
+ * When enabled always dispatch all kthreads directly.
  *
  * This allows to prioritize critical kernel threads that may potentially slow
- * down the entire system if they are blocked for too long (i.e., ksoftirqd/N,
- * rcuop/N, etc.).
- *
- * NOTE: this could cause interactivity problems or unfairness if there are too
- * many softirqs being scheduled (e.g., in presence of high RX network RX
- * traffic).
+ * down the entire system if they are blocked for too long, but it may also
+ * introduce interactivity issues or unfairness in scenarios with high kthread
+ * activity, such as heavy I/O or network traffic.
  */
 const volatile bool local_kthreads;
 
 /*
  * Scheduling statistics.
  */
-volatile u64 nr_direct_dispatches, nr_shared_dispatches;
+volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
 
 /*
  * Exit information.
@@ -266,13 +263,18 @@ static inline u64 task_vtime(struct task_struct *p)
 	return p->scx.dsq_vtime;
 }
 
+static inline u64 nr_waiting_tasks(void)
+{
+	return scx_bpf_dsq_nr_queued(shared_dsq_id);
+}
+
 /*
  * Evaluate task's time slice in function of the total amount of tasks that are
  * waiting to be dispatched and the task's weight.
  */
 static inline void task_refill_slice(struct task_struct *p)
 {
-	u64 slice, nr_waiting = scx_bpf_dsq_nr_queued(shared_dsq_id);
+	u64 slice, nr_waiting = nr_waiting_tasks();
 
 	slice = slice_max / (nr_waiting + 1);
 	p->scx.slice = CLAMP(slice, slice_min, slice_max);
@@ -292,18 +294,21 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 	s32 cpu;
 
 	/*
+	 * If the task isn't allowed to use its previously used CPU it means
+	 * that it's changing affinity. In this case just pick a random CPU in
+	 * its new allowed CPU domain.
+	 */
+	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+		prev_cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+
+	/*
 	 * For tasks that can run only on a single CPU, we can simply verify if
 	 * their only allowed CPU is still idle.
 	 */
-	if (p->nr_cpus_allowed == 1) {
+	if (p->nr_cpus_allowed == 1 || p->migration_disabled) {
 		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
 			return prev_cpu;
-		/*
-		 * If local_kthreads is enabled, always dispatch per-CPU
-		 * kthreads directly, even if their allowed CPU is not idle.
-		 */
-		if (local_kthreads && is_kthread(p))
-			return prev_cpu;
+
 		return -ENOENT;
 	}
 
@@ -469,14 +474,20 @@ out_put_cpumask:
  */
 static int dispatch_direct_cpu(struct task_struct *p, s32 cpu, u64 enq_flags)
 {
-	u64 vtime = task_vtime(p);
-	u64 dsq_id = cpu_to_dsq(cpu);
+	s32 dsq_id;
 
 	/*
-	 * Dispatch the task to the target per-CPU DSQ.
+	 * Make sure the CPU is valid and usable by the task.
 	 */
-	scx_bpf_dispatch_vtime(p, dsq_id, SCX_SLICE_DFL, vtime, enq_flags);
+	if (cpu < 0 || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+		return -EINVAL;
+	dsq_id = cpu_to_dsq(cpu);
 
+	/*
+	 * Dispatch the task to the per-CPU DSQ.
+	 */
+	scx_bpf_dispatch_vtime(p, dsq_id, SCX_SLICE_DFL,
+			       task_vtime(p), enq_flags);
 	/*
 	 * Wake-up the target CPU to make sure that the task is consumed as
 	 * soon as possible.
@@ -508,12 +519,10 @@ s32 BPF_STRUCT_OPS(fair_select_cpu, struct task_struct *p,
 		return prev_cpu;
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags);
-	if (cpu >= 0) {
-		dispatch_direct_cpu(p, cpu, 0);
+	if (!dispatch_direct_cpu(p, cpu, 0))
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
-	} else {
+	else
 		cpu = prev_cpu;
-	}
 
 	tctx->select_cpu_done = true;
 
@@ -527,7 +536,24 @@ s32 BPF_STRUCT_OPS(fair_select_cpu, struct task_struct *p,
 void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx;
-	s32 cpu, prev_cpu = scx_bpf_task_cpu(p);
+	s32 cpu;
+
+	/*
+	 * Special case for per-CPU kthreads: we want to run them as soon as
+	 * possible, as they are usually important for system performance and
+	 * responsiveness, so dispatch them immediately on the local DSQ of
+	 * their assigned CPU and allow them to preempt the currently running
+	 * task, if present.
+	 *
+	 * If local_kthreads is enabled, consider all kthreads as critical and
+	 * always dispatch them directly.
+	 */
+	if (is_kthread(p) && (local_kthreads || p->nr_cpus_allowed == 1)) {
+		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
+				 enq_flags | SCX_ENQ_PREEMPT);
+		__sync_fetch_and_add(&nr_kthread_dispatches, 1);
+		return;
+	}
 
 	/*
 	 * During ttwu, the kernel may decide to skip ->select_task_rq() (e.g.,
@@ -542,9 +568,8 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	tctx = try_lookup_task_ctx(p);
 	if (tctx && !tctx->select_cpu_done) {
-		cpu = pick_idle_cpu(p, prev_cpu, 0);
-		if (cpu >= 0) {
-			dispatch_direct_cpu(p, cpu, enq_flags);
+		cpu = pick_idle_cpu(p, scx_bpf_task_cpu(p), 0);
+		if (!dispatch_direct_cpu(p, cpu, enq_flags)) {
 			__sync_fetch_and_add(&nr_direct_dispatches, 1);
 			return;
 		}
@@ -567,41 +592,16 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_kick_cpu(cpu, 0);
 }
 
-/*
- * Consume a task dispatched directly to a specific CPU.
- */
-static bool consume_cpu_tasks(s32 cpu)
-{
-	s32 dsq_id = cpu_to_dsq(cpu);
-	struct task_struct *p;
-
-	bpf_for_each(scx_dsq, p, dsq_id, 0) {
-		/*
-		 * A task might have been dispatched to a per-CPU DSQ
-		 * associated to a CPU that the task can't use.
-		 *
-		 * In this case the task can't be consumed, so migrate it to
-		 * the shared DSQ to avoid stalls.
-		 */
-		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-			continue;
-		__COMPAT_scx_bpf_dispatch_vtime_from_dsq(BPF_FOR_EACH_ITER,
-						p, shared_dsq_id, 0);
-	}
-	return scx_bpf_consume(dsq_id);
-}
-
 void BPF_STRUCT_OPS(fair_dispatch, s32 cpu, struct task_struct *prev)
 {
 	/*
-	 * Consume directly dispatched tasks, so that they can immediately use
-	 * their assigned CPU.
+	 * First, try to consume a task directly dispatched to this CPU.
 	 */
-	if (consume_cpu_tasks(cpu))
+	if (scx_bpf_consume(cpu_to_dsq(cpu)))
 		return;
 
 	/*
-	 * Consume the first task from the shared DSQ.
+	 * Then consume the first task from the shared DSQ.
 	 */
 	if (scx_bpf_consume(shared_dsq_id))
 		return;
@@ -845,9 +845,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(fair_init)
 	}
 
 	/*
-	 * Create the global priority DSQ (for interactive tasks).
+	 * Create the shared DSQ.
 	 *
-	 * Allocate a new DSQ id that does not clash with any valid CPU id.
+	 * Allocate the new DSQ id to not clash with any valid CPU id.
 	 */
 	shared_dsq_id = nr_cpu_ids;
 	err = scx_bpf_create_dsq(shared_dsq_id, -1);

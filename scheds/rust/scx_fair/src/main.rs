@@ -68,12 +68,11 @@ struct Opts {
     #[clap(short = 'l', long, default_value = "20000")]
     slice_us_lag: u64,
 
-    /// Enable per-CPU kthreads prioritization.
+    /// Enable kthreads prioritization.
     ///
-    /// Enabling this can enhance the performance of interrupt-driven workloads (e.g., networking
-    /// throughput) over regular system/user workloads. However, it may also introduce
-    /// interactivity issues or unfairness under heavy interrupt-driven loads, such as high RX
-    /// network traffic.
+    /// Enabling this can improve system performance, but it may also introduce interactivity
+    /// issues or unfairness in scenarios with high kthread activity, such as heavy I/O or network
+    /// traffic.
     #[clap(short = 'k', long, action = clap::ArgAction::SetTrue)]
     local_kthreads: bool,
 
@@ -251,6 +250,7 @@ impl<'a> Scheduler<'a> {
 
     fn get_metrics(&self) -> Metrics {
         Metrics {
+            nr_kthread_dispatches: self.skel.maps.bss_data.nr_kthread_dispatches,
             nr_direct_dispatches: self.skel.maps.bss_data.nr_direct_dispatches,
             nr_shared_dispatches: self.skel.maps.bss_data.nr_shared_dispatches,
         }
