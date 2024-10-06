@@ -68,13 +68,6 @@ struct Opts {
     #[clap(short = 'l', long, default_value = "20000")]
     slice_us_lag: u64,
 
-    /// Autotedetect and boost interactive tasks, giving them a higher priority.
-    ///
-    /// Enabling this option can be beneficial in soft latency-sensitive scenarios, such as gaming,
-    /// audio processing, multimedia, etc.
-    #[clap(short = 'L', long, action = clap::ArgAction::SetTrue)]
-    lowlatency: bool,
-
     /// Enable per-CPU kthreads prioritization.
     ///
     /// Enabling this can enhance the performance of interrupt-driven workloads (e.g., networking
@@ -149,7 +142,6 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.slice_max = opts.slice_us_max * 1000;
         skel.maps.rodata_data.slice_min = opts.slice_us_min * 1000;
         skel.maps.rodata_data.slice_lag = opts.slice_us_lag * 1000;
-        skel.maps.rodata_data.lowlatency = opts.lowlatency;
         skel.maps.rodata_data.local_kthreads = opts.local_kthreads;
 
         skel.maps.rodata_data.nr_cpus = libbpf_rs::num_possible_cpus().unwrap() as u64;

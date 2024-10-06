@@ -13,8 +13,7 @@ char _license[] SEC("license") = "GPL";
 static s32 shared_dsq_id;
 
 /*
- * Maximum multiplier for the dynamic task priority (only applied when
- * lowlatency mode is enabled).
+ * Maximum multiplier for the dynamic task priority.
  */
 #define MAX_LATENCY_WEIGHT	1000
 
@@ -24,11 +23,6 @@ static s32 shared_dsq_id;
 const volatile u64 slice_max = 20ULL * NSEC_PER_MSEC;
 const volatile u64 slice_min = 1ULL * NSEC_PER_MSEC;
 const volatile u64 slice_lag = 20ULL * NSEC_PER_MSEC;
-
-/*
- * Autotedetect and boost interactive tasks, giving them a higher priority.
- */
-const volatile bool lowlatency;
 
 /*
  * When enabled always dispatch per-CPU kthreads directly on their CPU DSQ.
@@ -133,7 +127,7 @@ struct task_ctx {
 	u64 nvcsw_ts;
 
 	/*
-	 * Task's dynamic priority multiplier (used only in lowlatency mode).
+	 * Task's dynamic priority multiplier.
 	 */
 	u64 lat_weight;
 
@@ -210,7 +204,7 @@ static inline bool is_kthread(const struct task_struct *p)
 }
 
 /*
- * Return the dynamic priority multiplier when "lowlatency" mode is enabled.
+ * Return the dynamic priority multiplier.
  *
  * The multiplier is evaluated in function of the task's average rate of
  * voluntary context switches per second.
@@ -230,8 +224,6 @@ static u64 task_dyn_prio(struct task_struct *p)
  */
 static u64 task_prio(struct task_struct *p)
 {
-	if (!lowlatency)
-		return p->scx.weight;
 	return p->scx.weight * task_dyn_prio(p);
 }
 
