@@ -282,7 +282,7 @@ static inline void task_refill_slice(struct task_struct *p)
 {
 	u64 slice, nr_waiting = scx_bpf_dsq_nr_queued(shared_dsq_id);
 
-	slice = scale_inverse_fair(p, slice_max) / (nr_waiting + 1);
+	slice = slice_max / (nr_waiting + 1);
 	p->scx.slice = CLAMP(slice, slice_min, slice_max);
 }
 
