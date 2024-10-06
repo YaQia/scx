@@ -10,7 +10,7 @@ char _license[] SEC("license") = "GPL";
 /*
  * Global DSQ used to dispatch tasks.
  */
-#define SHARED_DSQ	0
+static s32 shared_dsq_id;
 
 /*
  * Maximum multiplier for the dynamic task priority (only applied when
@@ -92,6 +92,21 @@ struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
 {
 	const u32 idx = 0;
 	return bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu);
+}
+
+/*
+ * Return the DSQ ID associated to a CPU, or shared_dsq_id if the CPU is not
+ * valid.
+ */
+static u64 cpu_to_dsq(s32 cpu)
+{
+	u64 nr_cpu_ids = scx_bpf_nr_cpu_ids();
+
+	if (cpu < 0 || cpu >= nr_cpu_ids) {
+		scx_bpf_error("Invalid cpu: %d", cpu);
+		return shared_dsq_id;
+	}
+	return (u64)cpu;
 }
 
 /*
@@ -242,7 +257,7 @@ static inline u64 task_vtime(struct task_struct *p)
  */
 static inline void task_refill_slice(struct task_struct *p)
 {
-	u64 slice, nr_waiting = scx_bpf_dsq_nr_queued(SHARED_DSQ);
+	u64 slice, nr_waiting = scx_bpf_dsq_nr_queued(shared_dsq_id);
 
 	slice = scale_inverse_fair(p, slice_max) / (nr_waiting + 1);
 	p->scx.slice = CLAMP(slice, slice_min, slice_max);
@@ -260,14 +275,6 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 	struct cpu_ctx *cctx;
 	struct task_ctx *tctx;
 	s32 cpu;
-
-	/*
-	 * If the task is rapidly switching affinity there's no point trying to
-	 * find the optimal idle CPU. Let's just dispatch it on the first CPU
-	 * available.
-	 */
-	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
-		return -ENOENT;
 
 	/*
 	 * For tasks that can run only on a single CPU, we can simply verify if
@@ -369,7 +376,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 		if (has_idle &&
 		    bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
 		    !(current->flags & PF_EXITING) &&
-		    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) == 0)
+		    scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) == 0)
 			goto out_put_cpumask;
 	}
 
@@ -442,6 +449,35 @@ out_put_cpumask:
 }
 
 /*
+ * Dispatch a task directly to the assigned CPU DSQ (used when an idle CPU is
+ * found).
+ */
+static int dispatch_direct_cpu(struct task_struct *p, s32 cpu, u64 enq_flags)
+{
+	struct bpf_cpumask *offline;
+	u64 vtime = task_vtime(p);
+	u64 dsq_id = cpu_to_dsq(cpu);
+
+	/*
+	 * Dispatch the task to the target per-CPU DSQ.
+	 */
+	scx_bpf_dispatch_vtime(p, dsq_id, SCX_SLICE_DFL, vtime, enq_flags);
+
+	/*
+	 * Wake-up the target CPU to make sure that the task is consumed as
+	 * soon as possible.
+	 *
+	 * Note that the target CPU must be activated, because the task has
+	 * been dispatched to a DSQ that only the target CPU can consume. If we
+	 * do not kick the CPU, and the CPU is idle, the task can stall in the
+	 * DSQ indefinitely.
+	 */
+	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+
+	return 0;
+}
+
+/*
  * Pick a target CPU for a task which is being woken up.
  *
  * If a task is dispatched here, ops.enqueue() will be skipped: task will be
@@ -459,7 +495,7 @@ s32 BPF_STRUCT_OPS(fair_select_cpu, struct task_struct *p,
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags);
 	if (cpu >= 0) {
-		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		dispatch_direct_cpu(p, cpu, 0);
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
 	} else {
 		cpu = prev_cpu;
@@ -495,7 +531,7 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 	if (tctx && !tctx->select_cpu_done) {
 		cpu = pick_idle_cpu(p, prev_cpu, 0);
 		if (cpu >= 0) {
-			scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+			dispatch_direct_cpu(p, cpu, enq_flags);
 			__sync_fetch_and_add(&nr_direct_dispatches, 1);
 			return;
 		}
@@ -505,7 +541,7 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Enqueue the task to the global DSQ. The task will be dispatched on
 	 * the first CPU that becomes available.
 	 */
-	scx_bpf_dispatch_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime, enq_flags);
+	scx_bpf_dispatch_vtime(p, shared_dsq_id, SCX_SLICE_DFL, vtime, enq_flags);
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 
 	/*
@@ -517,12 +553,43 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_kick_cpu(cpu, 0);
 }
 
+/*
+ * Consume a task dispatched directly to a specific CPU.
+ */
+static bool consume_cpu_tasks(s32 cpu)
+{
+	s32 dsq_id = cpu_to_dsq(cpu);
+	struct task_struct *p;
+
+	bpf_for_each(scx_dsq, p, dsq_id, 0) {
+		/*
+		 * A task might have been dispatched to a per-CPU DSQ
+		 * associated to a CPU that the task can't use.
+		 *
+		 * In this case the task can't be consumed, so migrate it to
+		 * the shared DSQ to avoid stalls.
+		 */
+		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		__COMPAT_scx_bpf_dispatch_vtime_from_dsq(BPF_FOR_EACH_ITER,
+						p, shared_dsq_id, 0);
+	}
+	return scx_bpf_consume(dsq_id);
+}
+
 void BPF_STRUCT_OPS(fair_dispatch, s32 cpu, struct task_struct *prev)
 {
 	/*
+	 * Consume directly dispatched tasks, so that they can immediately use
+	 * their assigned CPU.
+	 */
+	if (consume_cpu_tasks(cpu))
+		return;
+
+	/*
 	 * Consume the first task from the shared DSQ.
 	 */
-	if (scx_bpf_consume(SHARED_DSQ))
+	if (scx_bpf_consume(shared_dsq_id))
 		return;
 
 	/*
@@ -761,14 +828,27 @@ int enable_sibling_cpu(struct domain_arg *input)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(fair_init)
 {
+	u64 nr_cpu_ids = scx_bpf_nr_cpu_ids();
+	s32 cpu;
 	int err;
 
+	/* Create per-CPU DSQs (used to dispatch tasks directly on a CPU) */
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		err = scx_bpf_create_dsq(cpu_to_dsq(cpu), -1);
+		if (err) {
+			scx_bpf_error("failed to create per-CPU DSQ %d: %d",
+				      cpu, err);
+			return err;
+		}
+	}
+
 	/*
-	 * Create the global shared DSQ (for regular tasks).
+	 * Create the global priority DSQ (for interactive tasks).
 	 *
-	 * Allocate a new DSQ id that does not clash with any valid CPU id..
+	 * Allocate a new DSQ id that does not clash with any valid CPU id.
 	 */
-	err = scx_bpf_create_dsq(SHARED_DSQ, -1);
+	shared_dsq_id = nr_cpu_ids;
+	err = scx_bpf_create_dsq(shared_dsq_id, -1);
 	if (err) {
 		scx_bpf_error("failed to create shared DSQ: %d", err);
 		return err;
