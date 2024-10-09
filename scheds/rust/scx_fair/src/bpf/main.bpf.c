@@ -672,7 +672,28 @@ void BPF_STRUCT_OPS(fair_stopping, struct task_struct *p, bool runnable)
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return;
+
 	tctx->select_cpu_done = false;
+
+	/*
+	 * If the time slice is not fully depleted, it means that the task
+	 * voluntarily relased the CPU, therefore update the voluntary context
+	 * switch counter.
+	 *
+	 * NOTE: the sched_ext core implements sched_yield() by setting the
+	 * time slice to 0, so we won't boost the priority of tasks that are
+	 * explicitly calling sched_yield().
+	 *
+	 * This is actually a good thing, because we want to prioritize tasks
+	 * that are releasing the CPU, because they're doing I/O, waiting for
+	 * input or sending output to other tasks.
+	 *
+	 * Tasks that are using sched_yield() don't really need the priority
+	 * boost and when they get the chance to run again they will be
+	 * naturally prioritized by the vruntime-based scheduling policy.
+	 */
+	if (p->scx.slice > 0)
+		tctx->nvcsw++;
 
 	/*
 	 * Evaluate task's used time slice.
@@ -701,14 +722,12 @@ void BPF_STRUCT_OPS(fair_stopping, struct task_struct *p, bool runnable)
 		 * Evaluate the task's latency weight as the task's average
 		 * rate of voluntary context switches per second.
 		 */
-		u64 delta_nvcsw = p->nvcsw - tctx->nvcsw;
-		u64 avg_nvcsw = delta_nvcsw * NSEC_PER_SEC / delta_t;
+		u64 avg_nvcsw = tctx->nvcsw * NSEC_PER_SEC / delta_t;
 		u64 lat_weight = MIN(avg_nvcsw, MAX_LATENCY_WEIGHT);
 
-		tctx->lat_weight = calc_avg(tctx->lat_weight, lat_weight);
-
-		tctx->nvcsw = p->nvcsw;
+		tctx->nvcsw = 0;
 		tctx->nvcsw_ts = now;
+		tctx->lat_weight = calc_avg(tctx->lat_weight, lat_weight);
 	}
 }
 
@@ -725,7 +744,6 @@ void BPF_STRUCT_OPS(fair_enable, struct task_struct *p)
 		return;
 	}
 	tctx->sum_exec_runtime = p->se.sum_exec_runtime;
-	tctx->nvcsw = p->nvcsw;
 	tctx->nvcsw_ts = bpf_ktime_get_ns();
 }
 
@@ -749,11 +767,6 @@ s32 BPF_STRUCT_OPS(fair_init_task, struct task_struct *p,
 	if (cpumask)
 		bpf_cpumask_release(cpumask);
 
-	tctx->sum_exec_runtime = p->se.sum_exec_runtime;
-	tctx->nvcsw = p->nvcsw;
-	tctx->nvcsw_ts = bpf_ktime_get_ns();
-	tctx->lat_weight = MIN(p->nvcsw * NSEC_PER_SEC / tctx->nvcsw_ts,
-			       MAX_LATENCY_WEIGHT);
 	return 0;
 }
 
