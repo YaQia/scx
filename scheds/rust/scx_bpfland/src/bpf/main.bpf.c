@@ -853,20 +853,15 @@ void BPF_STRUCT_OPS(bpfland_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 cpu, dsq_id;
 
 	/*
-	 * Special case for per-CPU kthreads: we want to run them as soon as
-	 * possible, as they are usually important for system performance and
-	 * responsiveness, so dispatch them immediately on the local DSQ of
-	 * their assigned CPU and allow them to preempt the currently running
-	 * task, if present.
-	 *
-	 * If local_kthreads is enabled, consider all kthreads as critical and
-	 * always dispatch them directly.
+	 * If local_kthreads is enabled, consider per-CPU kthreads as critical
+	 * and always dispatch them directly.
 	 */
-	if (is_kthread(p) && (local_kthreads || p->nr_cpus_allowed == 1)) {
-		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
-				 enq_flags | SCX_ENQ_PREEMPT);
-		__sync_fetch_and_add(&nr_kthread_dispatches, 1);
-		return;
+	if (local_kthreads && is_kthread(p) && p->nr_cpus_allowed == 1) {
+		cpu = scx_bpf_task_cpu(p);
+		if (!dispatch_direct_cpu(p, cpu, enq_flags)) {
+			__sync_fetch_and_add(&nr_kthread_dispatches, 1);
+			return;
+		}
 	}
 
 	/*
