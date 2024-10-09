@@ -143,7 +143,6 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.slice_lag = opts.slice_us_lag * 1000;
         skel.maps.rodata_data.local_kthreads = opts.local_kthreads;
 
-        skel.maps.rodata_data.nr_cpus = libbpf_rs::num_possible_cpus().unwrap() as u64;
         skel.maps.rodata_data.smt_enabled = smt_enabled;
 
         // Load the BPF program for validation.

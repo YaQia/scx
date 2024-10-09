@@ -45,9 +45,9 @@ volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
 UEI_DEFINE(uei);
 
 /*
- * Amount of CPUs in the system.
+ * Amount of possible CPUs in the system.
  */
-const volatile u64 nr_cpus = 8;
+static u64 nr_cpu_ids;
 
 /*
  * CPUs in the system have SMT is enabled.
@@ -91,8 +91,6 @@ struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
  */
 static u64 cpu_to_dsq(s32 cpu)
 {
-	u64 nr_cpu_ids = scx_bpf_nr_cpu_ids();
-
 	if (cpu < 0 || cpu >= nr_cpu_ids) {
 		scx_bpf_error("Invalid cpu: %d", cpu);
 		return shared_dsq_id;
@@ -109,7 +107,6 @@ struct task_ctx {
 	/*
 	 * Temporary cpumask for calculating scheduling domains.
 	 */
-	struct bpf_cpumask __kptr *cpumask;
 	struct bpf_cpumask __kptr *llc_cpumask;
 
 	/*
@@ -295,11 +292,11 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 
 	/*
 	 * If the task isn't allowed to use its previously used CPU it means
-	 * that it's changing affinity. In this case just pick a random CPU in
-	 * its new allowed CPU domain.
+	 * that it's changing affinity. In this case try to pick any random
+	 * idle CPU in its new allowed CPU domain.
 	 */
 	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
-		prev_cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+		return scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 
 	/*
 	 * For tasks that can run only on a single CPU, we can simply verify if
@@ -309,7 +306,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
 			return prev_cpu;
 
-		return -ENOENT;
+		return -EBUSY;
 	}
 
 	/*
@@ -322,7 +319,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 	llc_mask = tctx->llc_cpumask;
 	if (!llc_mask) {
 		scx_bpf_error("task LLC cpumask not initialized");
-		return -ENOENT;
+		return -EINVAL;
 	}
 
 	/*
@@ -337,14 +334,14 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 	 */
 	cctx = try_lookup_cpu_ctx(prev_cpu);
 	if (!cctx) {
-		cpu = -ENOENT;
+		cpu = -EINVAL;
 		goto out_put_cpumask;
 	}
 
 	llc_domain = cctx->llc_cpumask;
 	if (!llc_domain) {
 		scx_bpf_error("CPU LLC cpumask not initialized");
-		cpu = -ENOENT;
+		cpu = -EINVAL;
 		goto out_put_cpumask;
 	}
 
@@ -367,14 +364,14 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 
 		cctx = try_lookup_cpu_ctx(cpu);
 		if (!cctx) {
-			cpu = -ENOENT;
+			cpu = -EINVAL;
 			goto out_put_cpumask;
 		}
 
 		llc_domain = cctx->llc_cpumask;
 		if (!llc_domain) {
 			scx_bpf_error("CPU LLC cpumask not initialized");
-			cpu = -ENOENT;
+			cpu = -EINVAL;
 			goto out_put_cpumask;
 		}
 
@@ -415,7 +412,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 		 * domain.
 		 */
 		cpu = bpf_cpumask_any_and_distribute(cast_mask(llc_mask), idle_smtmask);
-		if (cpu >= 0 && cpu < nr_cpus &&
+		if (cpu >= 0 && cpu < nr_cpu_ids &&
 		    scx_bpf_test_and_clear_cpu_idle(cpu))
 			goto out_put_cpumask;
 
@@ -423,7 +420,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 		 * Otherwise, search for a full-idle SMT core in the system.
 		 */
 		cpu = bpf_cpumask_any_and_distribute(p->cpus_ptr, idle_smtmask);
-		if (cpu >= 0 && cpu < nr_cpus &&
+		if (cpu >= 0 && cpu < nr_cpu_ids &&
 		    scx_bpf_test_and_clear_cpu_idle(cpu))
 			goto out_put_cpumask;
 	}
@@ -441,7 +438,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 	 * the SMT state).
 	 */
 	cpu = bpf_cpumask_any_and_distribute(cast_mask(llc_mask), idle_cpumask);
-	if (cpu >= 0 && cpu < nr_cpus &&
+	if (cpu >= 0 && cpu < nr_cpu_ids &&
 	    scx_bpf_test_and_clear_cpu_idle(cpu))
 		goto out_put_cpumask;
 
@@ -450,16 +447,14 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 	 * the SMT state).
 	 */
 	cpu = bpf_cpumask_any_and_distribute(p->cpus_ptr, idle_cpumask);
-	if (cpu >= 0 && cpu < nr_cpus &&
+	if (cpu >= 0 && cpu < nr_cpu_ids &&
 	    scx_bpf_test_and_clear_cpu_idle(cpu))
 		goto out_put_cpumask;
 
 	/*
-	 * If all the previous attempts have failed, queue the task to a global
-	 * DSQ and simply dispatch it on the first CPU that becomes available
-	 * in the task's domain.
+	 * No idle CPU usable by the task has been found.
 	 */
-	cpu = -ENOENT;
+	cpu = -EBUSY;
 
 out_put_cpumask:
 	scx_bpf_put_idle_cpumask(idle_smtmask);
@@ -539,16 +534,10 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 cpu;
 
 	/*
-	 * Special case for per-CPU kthreads: we want to run them as soon as
-	 * possible, as they are usually important for system performance and
-	 * responsiveness, so dispatch them immediately on the local DSQ of
-	 * their assigned CPU and allow them to preempt the currently running
-	 * task, if present.
-	 *
-	 * If local_kthreads is enabled, consider all kthreads as critical and
-	 * always dispatch them directly.
+	 * If local_kthreads is enabled, consider all per-CPU kthreads as
+	 * critical and always dispatch them directly.
 	 */
-	if (is_kthread(p) && (local_kthreads || p->nr_cpus_allowed == 1)) {
+	if (local_kthreads && is_kthread(p) && p->nr_cpus_allowed == 1) {
 		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
 				 enq_flags | SCX_ENQ_PREEMPT);
 		__sync_fetch_and_add(&nr_kthread_dispatches, 1);
@@ -607,23 +596,12 @@ void BPF_STRUCT_OPS(fair_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/*
-	 * If the current task expired its time slice, its CPU is still a
-	 * full-idle SMT core and no other task wants to run, simply replenish
-	 * the task's time slice and let it run for another round.
+	 * If the current task expired its time slice and no other task wants
+	 * to run, simply replenish its time slice and let it run for another
+	 * round on the same CPU.
 	 */
-	if (prev && (prev->scx.flags & SCX_TASK_QUEUED)) {
-		const struct cpumask *idle_smtmask;
-
-		if (!smt_enabled) {
-			task_refill_slice(prev);
-			return;
-		}
-
-		idle_smtmask = scx_bpf_get_idle_smtmask();
-		if (bpf_cpumask_test_cpu(cpu, idle_smtmask))
-			task_refill_slice(prev);
-		scx_bpf_put_idle_cpumask(idle_smtmask);
-	}
+	if (prev && (prev->scx.flags & SCX_TASK_QUEUED))
+		task_refill_slice(prev);
 }
 
 /*
@@ -830,9 +808,10 @@ int enable_sibling_cpu(struct domain_arg *input)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(fair_init)
 {
-	u64 nr_cpu_ids = scx_bpf_nr_cpu_ids();
 	s32 cpu;
 	int err;
+
+	nr_cpu_ids = scx_bpf_nr_cpu_ids();
 
 	/* Create per-CPU DSQs (used to dispatch tasks directly on a CPU) */
 	bpf_for(cpu, 0, nr_cpu_ids) {
