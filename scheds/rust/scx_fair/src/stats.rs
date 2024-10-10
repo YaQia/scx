@@ -19,17 +19,20 @@ pub struct Metrics {
     pub nr_direct_dispatches: u64,
     #[stat(desc = "Number of task global dispatches")]
     pub nr_shared_dispatches: u64,
+    #[stat(desc = "Number of migrated task dispatches")]
+    pub nr_migrate_dispatches: u64,
 }
 
 impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] dispatch -> kthread: {:<5} direct: {:<5} shared: {:<5}",
+            "[{}] dispatch -> kthread: {:<5} direct: {:<5} shared: {:<5} migrated: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_kthread_dispatches,
             self.nr_direct_dispatches,
-            self.nr_shared_dispatches
+            self.nr_shared_dispatches,
+            self.nr_migrate_dispatches
         )?;
         Ok(())
     }
@@ -39,6 +42,7 @@ impl Metrics {
             nr_kthread_dispatches: self.nr_kthread_dispatches - rhs.nr_kthread_dispatches,
             nr_direct_dispatches: self.nr_direct_dispatches - rhs.nr_direct_dispatches,
             nr_shared_dispatches: self.nr_shared_dispatches - rhs.nr_shared_dispatches,
+            nr_migrate_dispatches: self.nr_migrate_dispatches - rhs.nr_migrate_dispatches,
             ..self.clone()
         }
     }

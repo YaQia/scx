@@ -37,7 +37,8 @@ const volatile bool local_kthreads;
 /*
  * Scheduling statistics.
  */
-volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
+volatile u64 nr_kthread_dispatches, nr_direct_dispatches,
+	     nr_shared_dispatches, nr_migrate_dispatches;
 
 /*
  * Exit information.
@@ -483,16 +484,6 @@ static int dispatch_direct_cpu(struct task_struct *p, s32 cpu, u64 enq_flags)
 	 */
 	scx_bpf_dispatch_vtime(p, dsq_id, SCX_SLICE_DFL,
 			       task_vtime(p), enq_flags);
-	/*
-	 * Wake-up the target CPU to make sure that the task is consumed as
-	 * soon as possible.
-	 *
-	 * Note that the target CPU must be activated, because the task has
-	 * been dispatched to a DSQ that only the target CPU can consume. If we
-	 * do not kick the CPU, and the CPU is idle, the task can stall in the
-	 * DSQ indefinitely.
-	 */
-	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
 	return 0;
 }
@@ -525,6 +516,39 @@ s32 BPF_STRUCT_OPS(fair_select_cpu, struct task_struct *p,
 }
 
 /*
+ * Wake up the CPU of the first task queued to @dsq_id.
+ *
+ * If the first task can't be dispatched on the corresponding DSQ, because its
+ * cpumask doesn't allow it, automatically migrate it to the shared DSQ.
+ */
+static void kick_cpu_from_dsq(s32 dsq_id)
+{
+	bool is_shared = (dsq_id == shared_dsq_id);
+	struct task_struct *p;
+
+	bpf_for_each(scx_dsq, p, dsq_id, 0) {
+		s32 task_cpu = scx_bpf_task_cpu(p);
+		s32 cpu = is_shared ? task_cpu : dsq_id;
+
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+			if (!is_shared &&
+			    !__COMPAT_scx_bpf_dispatch_from_dsq(BPF_FOR_EACH_ITER,
+								p, shared_dsq_id, 0)) {
+				scx_bpf_error("failed to migrate task %d (%s) to the shared DSQ",
+					      p->pid, p->comm);
+				return;
+			}
+			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+			if (cpu != task_cpu)
+				__sync_fetch_and_add(&nr_migrate_dispatches, 1);
+		}
+		if (cpu >= 0)
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		break;
+	}
+}
+
+/*
  * Dispatch all the other tasks that were not dispatched directly in
  * select_cpu().
  */
@@ -534,10 +558,12 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 cpu;
 
 	/*
-	 * If local_kthreads is enabled, consider all per-CPU kthreads as
-	 * critical and always dispatch them directly.
+	 * Per-CPU kthreads are critical for system responsiveness so make sure
+	 * they are dispatched before any other task.
+	 *
+	 * If local_kthread is specified dispatch all kthreads directly.
 	 */
-	if (local_kthreads && is_kthread(p) && p->nr_cpus_allowed == 1) {
+	if (is_kthread(p) && (local_kthreads || p->nr_cpus_allowed == 1)) {
 		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
 				 enq_flags | SCX_ENQ_PREEMPT);
 		__sync_fetch_and_add(&nr_kthread_dispatches, 1);
@@ -559,6 +585,7 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 	if (tctx && !tctx->select_cpu_done) {
 		cpu = pick_idle_cpu(p, scx_bpf_task_cpu(p), 0);
 		if (!dispatch_direct_cpu(p, cpu, enq_flags)) {
+			kick_cpu_from_dsq(cpu_to_dsq(cpu));
 			__sync_fetch_and_add(&nr_direct_dispatches, 1);
 			return;
 		}
@@ -573,26 +600,26 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 
 	/*
-	 * If there are idle CPUs that are usable by the task, wake them up to
-	 * see whether they'd be able to steal the just queued task.
+	 * Wake up the CPU of the first task in the shared DSQ, so that it can
+	 * immediately consume the task.
 	 */
-	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-	if (cpu >= 0)
-		scx_bpf_kick_cpu(cpu, 0);
+	kick_cpu_from_dsq(shared_dsq_id);
 }
 
 void BPF_STRUCT_OPS(fair_dispatch, s32 cpu, struct task_struct *prev)
 {
-	/*
-	 * First, try to consume a task directly dispatched to this CPU.
-	 */
-	if (scx_bpf_consume(cpu_to_dsq(cpu)))
-		return;
+	int dispatched = 0;
 
 	/*
-	 * Then consume the first task from the shared DSQ.
+	 * Make sure to give the opportunity to consume tasks from both the
+	 * per-CPU DSQ and the shared DSQ to prevent starvation.
 	 */
+	if (scx_bpf_consume(cpu_to_dsq(cpu)))
+		dispatched++;
 	if (scx_bpf_consume(shared_dsq_id))
+		dispatched++;
+	barrier();
+	if (dispatched > 0)
 		return;
 
 	/*

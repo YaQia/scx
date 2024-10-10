@@ -252,6 +252,7 @@ impl<'a> Scheduler<'a> {
             nr_kthread_dispatches: self.skel.maps.bss_data.nr_kthread_dispatches,
             nr_direct_dispatches: self.skel.maps.bss_data.nr_direct_dispatches,
             nr_shared_dispatches: self.skel.maps.bss_data.nr_shared_dispatches,
+            nr_migrate_dispatches: self.skel.maps.bss_data.nr_migrate_dispatches,
         }
     }
 
