@@ -455,47 +455,28 @@ out_put_cpumask:
 s32 BPF_STRUCT_OPS(fair_select_cpu, struct task_struct *p,
 			s32 prev_cpu, u64 wake_flags)
 {
-	struct task_ctx *tctx;
 	s32 cpu;
-
-	tctx = try_lookup_task_ctx(p);
-	if (!tctx)
-		return prev_cpu;
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags);
 	if (cpu >= 0) {
 		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
-	} else {
-		cpu = prev_cpu;
+		return cpu;
 	}
 
-	return cpu;
+	return prev_cpu;
 }
 
 /*
- * Wake up the CPU of the first task queued to @dsq_id.
- *
- * If the first task can't be dispatched on the corresponding DSQ, because its
- * cpumask doesn't allow it, automatically migrate it to the shared DSQ.
+ * Wake up an idle CPU for task @p.
  */
-static void kick_cpu_from_dsq(s32 dsq_id)
+static void kick_task_cpu(struct task_struct *p)
 {
-	struct task_struct *p;
+	s32 cpu = scx_bpf_task_cpu(p);
 
-	bpf_for_each(scx_dsq, p, dsq_id, 0) {
-		s32 task_cpu = scx_bpf_task_cpu(p);
-		s32 cpu = task_cpu;
-
-		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-			if (cpu != task_cpu)
-				__sync_fetch_and_add(&nr_migrate_dispatches, 1);
-		}
-		if (cpu >= 0)
-			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-		break;
-	}
+	cpu = pick_idle_cpu(p, cpu, 0);
+	if (cpu >= 0)
+		scx_bpf_kick_cpu(cpu, 0);
 }
 
 /*
@@ -528,10 +509,10 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 
 	/*
-	 * If there are idle CPUs that are usable by the task, wake them up to
-	 * see whether they'd be able to steal the just queued task.
+	 * If there is an idle CPU available for the task, wake it up so it can
+	 * consume the task immediately.
 	 */
-	kick_cpu_from_dsq(SHARED_DSQ);
+	kick_task_cpu(p);
 }
 
 void BPF_STRUCT_OPS(fair_dispatch, s32 cpu, struct task_struct *prev)
