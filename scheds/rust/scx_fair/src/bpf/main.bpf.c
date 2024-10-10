@@ -227,7 +227,7 @@ static u64 task_prio(struct task_struct *p)
  */
 static u64 task_lag(struct task_struct *p)
 {
-	return slice_lag * task_prio(p) / 100;
+	return MIN(slice_lag * task_prio(p) / 100, NSEC_PER_SEC);
 }
 
 /*
@@ -698,7 +698,7 @@ void BPF_STRUCT_OPS(fair_stopping, struct task_struct *p, bool runnable)
 	/*
 	 * Evaluate task's used time slice.
 	 */
-	slice = MIN(p->se.sum_exec_runtime - tctx->sum_exec_runtime, slice_max);
+	slice = CLAMP(p->se.sum_exec_runtime - tctx->sum_exec_runtime, slice_min, slice_max);
 	tctx->sum_exec_runtime = p->se.sum_exec_runtime;
 	slice = scale_inverse_fair(p, slice);
 
