@@ -15,7 +15,7 @@ struct load_avg {
 };
 
 struct cpu_load {
-	bool migrating;
+	bool selecting;
 	u64 weight;
 	u64 last_balance_time;
 	struct task_struct *prev;

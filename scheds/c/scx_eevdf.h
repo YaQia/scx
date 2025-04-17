@@ -1,4 +1,5 @@
 #include <scx/common.bpf.h>
+#include <scx/bpf_atomic.h>
 
 struct load_avg {
 	u64 last_update_time;
@@ -8,7 +9,7 @@ struct load_avg {
 };
 
 struct cpu_load {
-  bool migrating;
+  u32 selecting;
 	u64 weight;
   u64 last_balance_time;
   struct task_struct *prev;
