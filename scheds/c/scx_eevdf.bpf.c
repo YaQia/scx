@@ -360,77 +360,78 @@ static s32 get_affine_cpu(struct task_struct *p, s32 prev_cpu, bool *idle, u64 w
         scx_bpf_error("previous CPU's percpu_load can not be referenced.");
         return -1;
     }
-    u64 prev_eff_load;
-    prev_eff_load = prev_load->avg.load_avg * prev_rq->cpu_capacity;
+    struct cpu_load *this_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, this_cpu);
+    if (unlikely(!this_load)) {
+        scx_bpf_error("previous CPU's percpu_load can not be referenced.");
+        return -1;
+    }
+    // u64 prev_eff_load;
+    // prev_eff_load = prev_load->avg.load_avg * prev_rq->cpu_capacity;
     // if (p_ctx->avg.last_update_time == 0) {
     //     // p is migrating. So we don't need to subtract its load.
     //     prev_eff_load = prev_load->avg.load_avg * prev_rq->cpu_capacity;
     // } else {
     //     prev_eff_load = (prev_load->avg.load_avg - p_load_avg) * prev_rq->cpu_capacity;
     // }
-    struct cpu_load *min_load;
-    u64 min_eff_load;
-    s32 min_load_cpu;
-    const struct rq *min_rq = prev_rq;
-    min_load = prev_load;
-    min_eff_load = prev_eff_load;
-    min_load_cpu = prev_cpu;
-    bpf_for(cpu, 0, nr_cpu_ids) {
-        if (cpu == prev_cpu || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-            continue;
-        struct cpu_load *this_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, cpu);
-        if (unlikely(!this_load)) {
-            scx_bpf_error("percpu_load can not be referenced.");
-            return -1;
-        }
-        if (__sync_val_compare_and_swap(&this_load->selecting, 0, 1) != 0)
-            continue;
-        const struct rq *this_rq = scx_bpf_cpu_rq(cpu);
-        if (unlikely(!this_rq)) {
-            scx_bpf_error("cpu rq can not be referenced.");
-            return -1;
-        }
-        const u64 this_eff_load = this_load->avg.load_avg * this_rq->cpu_capacity;
-        if (idle_cpu(cpu)) {
-            min_load = this_load;
-            min_eff_load = this_eff_load;
-            min_load_cpu = cpu;
-            min_rq = this_rq;
-            break;
-        } else if (this_eff_load < min_eff_load) {
-            if (min_load_cpu != prev_cpu) {
-                __sync_lock_test_and_set(&min_load->selecting, 0);
-            }
-            min_load = this_load;
-            min_eff_load = this_eff_load;
-            min_load_cpu = cpu;
-            min_rq = this_rq;
-        }
-    }
+    // struct cpu_load *min_load;
+    // u64 min_eff_load;
+    // s32 min_load_cpu;
+    // const struct rq *min_rq = prev_rq;
+    // min_load = prev_load;
+    // min_eff_load = prev_eff_load;
+    // min_load_cpu = prev_cpu;
+    // bpf_for(cpu, 0, nr_cpu_ids) {
+    //     if (cpu == prev_cpu || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+    //         continue;
+    //     struct cpu_load *this_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, cpu);
+    //     if (unlikely(!this_load)) {
+    //         scx_bpf_error("percpu_load can not be referenced.");
+    //         return -1;
+    //     }
+    //     const struct rq *this_rq = scx_bpf_cpu_rq(cpu);
+    //     if (unlikely(!this_rq)) {
+    //         scx_bpf_error("cpu rq can not be referenced.");
+    //         return -1;
+    //     }
+    //     const u64 this_eff_load = this_load->avg.load_avg * this_rq->cpu_capacity;
+    //     if (idle_cpu(cpu)) {
+    //         if (__sync_val_compare_and_swap(&this_load->selecting, 0, 1) != 0)
+    //             continue;
+    //         if (min_load_cpu != prev_cpu) {
+    //             __sync_lock_test_and_set(&min_load->selecting, 0);
+    //         }
+    //         min_load = this_load;
+    //         min_eff_load = this_eff_load;
+    //         min_load_cpu = cpu;
+    //         min_rq = this_rq;
+    //         break;
+    //     } else if (this_eff_load < min_eff_load) {
+    //         if (__sync_val_compare_and_swap(&this_load->selecting, 0, 1) != 0)
+    //             continue;
+    //         if (min_load_cpu != prev_cpu) {
+    //             __sync_lock_test_and_set(&min_load->selecting, 0);
+    //         }
+    //         min_load = this_load;
+    //         min_eff_load = this_eff_load;
+    //         min_load_cpu = cpu;
+    //         min_rq = this_rq;
+    //     }
+    // }
 
     // if min_eff_load is not full, we should consider load balance.
-    if (min_eff_load < 50 * min_rq->cpu_capacity) {
-        const u64 p_load_avg = p_ctx->avg.load_avg;
-        // If p is migrating, we don't need to subtract its load.
-        if (p_ctx->avg.last_update_time != 0) {
-            prev_eff_load = (prev_load->avg.load_avg - p_load_avg) * prev_rq->cpu_capacity;
+    const u64 p_load_avg = p_ctx->avg.load_avg;
+    // If p is migrating, we don't need to subtract its load.
+    u64 prev_eff_load = (prev_load->avg.load_avg - p_load_avg) * prev_rq->cpu_capacity;
+    u64 this_eff_load = (this_load->avg.load_avg + p_load_avg) * this_rq->cpu_capacity;
+    if ((wake_flags & WF_SYNC) && !(this_rq->curr->flags & PF_EXITING)) {
+        const u64 current_load = this_rq->curr->scx.weight;
+        if (this_eff_load < current_load) {
+            return this_cpu;
         }
-        min_eff_load = (min_load->avg.load_avg + p_load_avg) * min_rq->cpu_capacity;
-    } else {
-        __sync_lock_test_and_set(&min_load->selecting, 0);
-        return min_load_cpu;
+        this_eff_load -= current_load;
     }
-    if ((wake_flags & WF_SYNC) && !(min_rq->curr->flags & PF_EXITING)) {
-        const u64 current_load = min_rq->curr->scx.weight;
-        if (min_eff_load < current_load) {
-            __sync_lock_test_and_set(&min_load->selecting, 0);
-            return min_load_cpu;
-        }
-        min_eff_load -= current_load;
-    }
-    __sync_lock_test_and_set(&min_load->selecting, 0);
-    if (min_eff_load < prev_eff_load) {
-	    return min_load_cpu;
+    if (this_eff_load < prev_eff_load) {
+	    return this_cpu;
     } else {
 	    return prev_cpu;
     }
@@ -535,73 +536,75 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
     if (unlikely(nr_cpu_ids == 1)) {
         goto run_prev_again;
     }
-    const u64 now = bpf_ktime_get_ns();
-    if (now - this_load->last_balance_time < BALANCE_INTERVAL_NS) {
-        goto run_prev_again;
-    }
-    const struct cpumask *idle_mask = scx_bpf_get_idle_cpumask();
-    const struct cpumask *online_mask = scx_bpf_get_online_cpumask();
-    struct bpf_cpumask *notidle_mask = bpf_cpumask_create();
-    if (!notidle_mask) {
-        scx_bpf_put_cpumask(idle_mask);
-        scx_bpf_put_cpumask(online_mask);
-        scx_bpf_error("can not allocate a cpumask.");
-        return ;
-    }
-    bpf_cpumask_xor(notidle_mask, online_mask, idle_mask);
-    s32 target_cpu = bpf_cpumask_any_and_distribute(cast_mask(notidle_mask), online_mask);
-    if (target_cpu == cpu || target_cpu >= nr_cpu_ids) {
-        scx_bpf_put_cpumask(idle_mask);
-        scx_bpf_put_cpumask(online_mask);
-        bpf_cpumask_release(notidle_mask);
-        goto run_prev_again;
-    }
-    scx_bpf_put_cpumask(idle_mask);
-    scx_bpf_put_cpumask(online_mask);
-    bpf_cpumask_release(notidle_mask);
-	struct cpu_load *target_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, target_cpu);
-	if (unlikely(!target_load)) {
-	    scx_bpf_error("target_load can not be referenced.");
-        return ;
-	}
-    if (!scx_bpf_dsq_nr_queued(target_cpu)) {
-        goto run_prev_again;
-    }
-
  //    const u64 now = bpf_ktime_get_ns();
  //    if (now - this_load->last_balance_time < BALANCE_INTERVAL_NS) {
  //        goto run_prev_again;
  //    }
- //    this_load->last_balance_time = now;
- //    struct cpu_load *max_load = this_load;
- //    s32 max_load_cpu = cpu;
- //    s32 i;
-	// bpf_for(i, 0, nr_cpu_ids) {
-	//     if (i == cpu || !scx_bpf_dsq_nr_queued(i))
-	//         continue;
-	//
-	//     struct cpu_load *i_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, i);
-	//     if (unlikely(!i_load)) {
-	//         scx_bpf_error("i_load can not be referenced.");
-	//         return ;
-	//     }
- //        
- //        if (i_load->migrating) {
- //            continue;
- //        }
-	//
-	//     if (i_load->avg.load_avg > max_load->avg.load_avg) {
- //            max_load = i_load;
- //            max_load_cpu = i;
-	//     }
+ //    const struct cpumask *idle_mask = scx_bpf_get_idle_cpumask();
+ //    const struct cpumask *online_mask = scx_bpf_get_online_cpumask();
+ //    struct bpf_cpumask *notidle_mask = bpf_cpumask_create();
+ //    if (!notidle_mask) {
+ //        scx_bpf_put_cpumask(idle_mask);
+ //        scx_bpf_put_cpumask(online_mask);
+ //        scx_bpf_error("can not allocate a cpumask.");
+ //        return ;
  //    }
- //    // This means all CPUs have at most 1 task now. Skip the pull.
-	// if (max_load_cpu == cpu || !scx_bpf_dsq_nr_queued(max_load_cpu)
- //        || max_load->avg.load_avg < this_load->avg.load_avg + BALANCE_LOAD_THRESH)
+ //    bpf_cpumask_xor(notidle_mask, online_mask, idle_mask);
+ //    s32 target_cpu = bpf_cpumask_any_and_distribute(cast_mask(notidle_mask), online_mask);
+ //    if (target_cpu == cpu || target_cpu >= nr_cpu_ids) {
+ //        scx_bpf_put_cpumask(idle_mask);
+ //        scx_bpf_put_cpumask(online_mask);
+ //        bpf_cpumask_release(notidle_mask);
  //        goto run_prev_again;
- //    s32 target_cpu = max_load_cpu;
- //    struct cpu_load *target_load = max_load;
- //    target_load->migrating = true;
+ //    }
+ //    scx_bpf_put_cpumask(idle_mask);
+ //    scx_bpf_put_cpumask(online_mask);
+ //    bpf_cpumask_release(notidle_mask);
+	// struct cpu_load *target_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, target_cpu);
+	// if (unlikely(!target_load)) {
+	//     scx_bpf_error("target_load can not be referenced.");
+ //        return ;
+	// }
+ //    if (!scx_bpf_dsq_nr_queued(target_cpu)) {
+ //        goto run_prev_again;
+ //    }
+
+    const u64 now = bpf_ktime_get_ns();
+    if (now - this_load->last_balance_time < BALANCE_INTERVAL_NS) {
+        goto run_prev_again;
+    }
+    this_load->last_balance_time = now;
+    struct cpu_load *max_load = this_load;
+    s32 max_load_cpu = cpu;
+    s32 i;
+	bpf_for(i, 0, nr_cpu_ids) {
+	    if (i == cpu || !scx_bpf_dsq_nr_queued(i))
+	        continue;
+
+	    struct cpu_load *i_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, i);
+	    if (unlikely(!i_load)) {
+	        scx_bpf_error("i_load can not be referenced.");
+	        return ;
+	    }
+        
+	    if (i_load->avg.load_avg > max_load->avg.load_avg) {
+            if (__sync_val_compare_and_swap(&this_load->selecting, 0, 1) != 0)
+                continue;
+            if (max_load_cpu != cpu) {
+                __sync_lock_test_and_set(&max_load->selecting, 0);
+            }
+            max_load = i_load;
+            max_load_cpu = i;
+	    }
+    }
+    // This means all CPUs have at most 1 task now. Skip the pull.
+	if (max_load_cpu == cpu || !scx_bpf_dsq_nr_queued(max_load_cpu)
+        || max_load->avg.load_avg < this_load->avg.load_avg + BALANCE_LOAD_THRESH) {
+        __sync_lock_test_and_set(&max_load->selecting, 0);
+        goto run_prev_again;
+    }
+    s32 target_cpu = max_load_cpu;
+    struct cpu_load *target_load = max_load;
 
     const u64 *vtime_now_prev = bpf_map_lookup_percpu_elem(&vtime_now, &idx, target_cpu);
     if (unlikely(!vtime_now_prev)) {
@@ -628,9 +631,7 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
 	struct task_struct *p;
 	while ((p = bpf_iter_scx_dsq_next(&iter))) {
         // skip other schedulers' tasks(SCHED_DEADLINE/SCHED_FIFO/SCHED_RR)
-        if ((p->policy != SCHED_EXT && p->policy != SCHED_NORMAL)
-            || p->nr_cpus_allowed == 1 
-            || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+        if (p->nr_cpus_allowed == 1 || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
             continue;
         }
 
@@ -643,20 +644,22 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
             bpf_iter_scx_dsq_destroy(&iter);
             return ;
         }
-        // const u64 p_load_avg = p_ctx->avg.load_avg;
-        // const u64 target_eff_load = (target_load->avg.load_avg - p_load_avg) * target_rq->cpu_capacity;
-        // const u64 this_eff_load = (this_load->avg.load_avg + p_load_avg) * this_rq->cpu_capacity;
+        const u64 p_load_avg = p_ctx->avg.load_avg;
+        const u64 target_eff_load = (target_load->avg.load_avg - p_load_avg) * target_rq->cpu_capacity;
+        const u64 this_eff_load = (this_load->avg.load_avg + p_load_avg) * this_rq->cpu_capacity;
         // task is still hot
         if (target_load->prev == p
             && now - p_ctx->last_balance_time < BALANCE_INTERVAL_NS) {
             continue;
         }
-        if (/* target_eff_load + BALANCE_LOAD_THRESH * target_rq->cpu_capacity < this_eff_load
-            || */p_ctx->avg_slice < LC_APP_SLICE_THRESH 
+        if (target_eff_load < this_eff_load
+            || p_ctx->avg_slice < LC_APP_SLICE_THRESH 
             || p_ctx->avg.load_avg < LC_APP_LOAD_THRESH) {
             continue;
         }
-        if (!scx_bpf_dsq_move_vtime(&iter, p, cpu, p_ctx->enq_flags))
+        // if (!scx_bpf_dsq_move_vtime(&iter, p, cpu, p_ctx->enq_flags))
+        //     continue;
+        if (!scx_bpf_dsq_move(&iter, p, SCX_DSQ_LOCAL_ON | cpu, p_ctx->enq_flags))
             continue;
 
         p_ctx->last_balance_time = now;
@@ -667,23 +670,24 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
             bpf_iter_scx_dsq_destroy(&iter);
             return ;
         }
+        // bpf_printk("move %s[%d] from CPU%d[nr %d] to CPU%d[nr %d].", p->comm, p->pid, target_cpu, scx_bpf_dsq_nr_queued(target_cpu) + 1, cpu, scx_bpf_dsq_nr_queued(cpu));
+
         u64 vtime = p->scx.dsq_vtime;
         sub_positive(&vtime, *vtime_now_prev);
         vtime += *vtime_now_curr - DEFAULT_SLICE_NS;
         p->scx.dsq_vtime = vtime;
-
-        bpf_printk("move %s[%d] from CPU%d[nr %d] to CPU%d[nr %d].", p->comm, p->pid, target_cpu, scx_bpf_dsq_nr_queued(target_cpu) + 1, cpu, scx_bpf_dsq_nr_queued(cpu));
         update_load_avg(target_load, p_ctx, DO_DETACH);
         sub_positive(&target_load->weight, p_ctx->weight);
         update_load_avg(this_load, p_ctx, DO_ATTACH);
         this_load->weight += p_ctx->weight;
         scx_bpf_dsq_move_to_local(cpu);
+        
         bpf_iter_scx_dsq_destroy(&iter);
-        // target_load->migrating = false;
+        __sync_lock_test_and_set(&max_load->selecting, 0);
         return ;
 	}
 	bpf_iter_scx_dsq_destroy(&iter);
-    // target_load->migrating = false;
+    __sync_lock_test_and_set(&max_load->selecting, 0);
 run_prev_again:
     if (prev && prev->scx.flags & SCX_TASK_QUEUED) {
         prev->scx.slice = now - this_load->last_balance_time;
@@ -779,34 +783,40 @@ void BPF_STRUCT_OPS(eevdf_stopping, struct task_struct *p, bool runnable)
     }
     if (vtime_before(*vtime_now_local, p->scx.dsq_vtime))
         *vtime_now_local = p->scx.dsq_vtime;
+    if (!runnable) {
+        update_load_avg(cpu_load, p_ctx, 0);
+        sub_positive(&cpu_load->weight, p_ctx->weight);
+        sub_positive(&p->scx.dsq_vtime, *vtime_now_local);
+        p_ctx->runnable = false;
+    }
 }
 
 // Unlike ops.dequeue(), this function below will only be called when dequeue_task_scx().
-void BPF_STRUCT_OPS(eevdf_quiescent, struct task_struct *p, u64 deq_flags)
-{
-    const u32 idx = 0;
-    const s32 cpu = scx_bpf_task_cpu(p);
-    struct cpu_load *cpu_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, cpu);
-    if (unlikely(!cpu_load)) {
-        scx_bpf_error("can not get cpu load.");
-        return ;
-    }
-    struct task_ctx *p_ctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
-    if (unlikely(!p_ctx)) {
-        scx_bpf_error("[quiescent]: can not get task load.");
-        return ;
-    }
-    // IMPORTANT: Don't detach it! Slept task should not be detached at all!
-    update_load_avg(cpu_load, p_ctx, 0);
-    sub_positive(&cpu_load->weight, p_ctx->weight);
-    u64 *cpu_vtime_now = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
-    if (unlikely(!cpu_vtime_now)) {
-        scx_bpf_error("target CPU's vtime_now can not be referenced.");
-        return ;
-    }
-    sub_positive(&p->scx.dsq_vtime, *cpu_vtime_now);
-    p_ctx->runnable = false;
-}
+// void BPF_STRUCT_OPS(eevdf_quiescent, struct task_struct *p, u64 deq_flags)
+// {
+//     const u32 idx = 0;
+//     const s32 cpu = scx_bpf_task_cpu(p);
+//     struct cpu_load *cpu_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, cpu);
+//     if (unlikely(!cpu_load)) {
+//         scx_bpf_error("can not get cpu load.");
+//         return ;
+//     }
+//     struct task_ctx *p_ctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
+//     if (unlikely(!p_ctx)) {
+//         scx_bpf_error("[quiescent]: can not get task load.");
+//         return ;
+//     }
+//     // IMPORTANT: Don't detach it! Slept task should not be detached at all!
+//     update_load_avg(cpu_load, p_ctx, 0);
+//     sub_positive(&cpu_load->weight, p_ctx->weight);
+//     u64 *cpu_vtime_now = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
+//     if (unlikely(!cpu_vtime_now)) {
+//         scx_bpf_error("target CPU's vtime_now can not be referenced.");
+//         return ;
+//     }
+//     sub_positive(&p->scx.dsq_vtime, *cpu_vtime_now);
+//     p_ctx->runnable = false;
+// }
 
 void BPF_STRUCT_OPS(eevdf_set_weight, struct task_struct *p, u32 weight)
 {
@@ -883,7 +893,6 @@ void BPF_STRUCT_OPS(eevdf_exit_task, struct task_struct *p, struct scx_exit_task
         return ;
     }
     update_load_avg(cpu_load, p_ctx, DO_DETACH);
-    sub_positive(&cpu_load->weight, p_ctx->weight);
     // bpf_task_storage_delete(&task_ctx, p);
 }
 
@@ -948,7 +957,7 @@ SCX_OPS_DEFINE(eevdf_ops,
            .runnable        = (void *)eevdf_runnable,
            .running         = (void *)eevdf_running,
            .stopping        = (void *)eevdf_stopping,
-           .quiescent       = (void *)eevdf_quiescent,
+           // .quiescent       = (void *)eevdf_quiescent,
            .set_weight      = (void *)eevdf_set_weight,
            .enable          = (void *)eevdf_enable,
            .init_task       = (void *)eevdf_init_task,
