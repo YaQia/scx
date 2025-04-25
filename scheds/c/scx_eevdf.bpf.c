@@ -1,10 +1,11 @@
 #include "scx_eevdf.h"
 
-#define BALANCE_LOAD_THRESH 10
-#define BALANCE_INTERVAL_NS 2000000
-#define LC_APP_SLICE_THRESH 100000
-#define LC_APP_LOAD_THRESH  10
-#define DEFAULT_SLICE_NS    1000000
+#define BALANCE_LOAD_THRESH         10
+#define BALANCE_INTERVAL_NS         2000000
+#define BALANCE_PREV_INTERVAL_NS    10000000
+#define LC_APP_SLICE_THRESH         100000
+#define LC_APP_LOAD_THRESH          10
+#define DEFAULT_SLICE_NS            1000000
 char _license[] SEC("license") = "GPL";
 
 const volatile u32 nr_cpu_ids = 1;
@@ -88,17 +89,13 @@ accumulate_sum(u64 delta, struct load_avg *la, u64 load)
 	u64 periods;
 
 	delta += la->period_contrib;
-    // bpf_printk("delta: %luus", delta);
 
 	periods = delta / 1024; /* A period is 1024us (~1ms) */
-    // bpf_printk("period number: %lu", periods);
 	/*
 	 * Step 1: decay old *_sum if we crossed period boundaries.
 	 */
 	if (periods) {
-        // bpf_printk("before decay load_sum: %lu", sa->load_sum);
 		la->load_sum = decay_load(la->load_sum, periods);
-        // bpf_printk("after decay load_sum: %lu", sa->load_sum);
 
 		/*
 		 * Step 2
@@ -115,19 +112,15 @@ accumulate_sum(u64 delta, struct load_avg *la, u64 load)
 			 * the below usage of @contrib to disappear entirely,
 			 * so no point in calculating it.
 			 */
-            // bpf_printk("1024 - period_contrib: %u", 1024 - sa->period_contrib);
 			contrib = __accumulate_pelt_segments(periods,
 					1024 - la->period_contrib, delta);
-            // bpf_printk("contrib: %u", contrib);
 		}
 	}
 	la->period_contrib = delta;
 
-    // bpf_printk("load: %lu", load);
 	if (load)
 		la->load_sum += load * contrib;
 
-    // bpf_printk("load_sum: %lu", sa->load_sum);
 	return periods;
 }
 
@@ -174,20 +167,17 @@ ___update_load_avg(struct load_avg *la, unsigned long load)
 {
 	u32 divider = get_pelt_divider(la);
 
-    // bpf_printk("divider: %u", divider);
 	/*
 	 * Step 2: update *_avg.
 	 */
 	la->load_avg = (load * la->load_sum) / divider;
-    // bpf_printk("load_avg: %lu", sa->load_avg);
 }
 
 int __update_load_avg_p(u64 now, struct task_ctx *p_ctx)
 {
-    if (!p_ctx) {
+    if (unlikely(!p_ctx)) {
         return 0;
     }
-    // bpf_printk("computing load_avg for p");
 	if (___update_load_sum(now, &p_ctx->avg, p_ctx->runnable)) {
 		___update_load_avg(&p_ctx->avg, p_ctx->weight);
 		return 1;
@@ -197,10 +187,9 @@ int __update_load_avg_p(u64 now, struct task_ctx *p_ctx)
 
 int __update_load_avg_cpu(u64 now, struct cpu_load *cpu_load)
 {
-    if (!cpu_load) {
+    if (unlikely(!cpu_load)) {
         return 0;
     }
-    // bpf_printk("computing load_avg for cpu");
 	if (___update_load_sum(now, &cpu_load->avg, cpu_load->weight)) {
 		___update_load_avg(&cpu_load->avg, 1);
 		return 1;
@@ -267,7 +256,7 @@ static inline void update_load_avg(struct cpu_load *cpu_load, struct task_ctx *p
     }
 
     // this might be strange, but better than using `vtime_now`
-    u64 now = bpf_ktime_get_ns();
+    u64 now = scx_bpf_now();
 
     if (p_ctx->avg.last_update_time)
         __update_load_avg_p(now, p_ctx);
@@ -355,12 +344,12 @@ static s32 get_affine_cpu(struct task_struct *p, s32 prev_cpu, bool *idle, u64 w
         return -1;
     }
     const u32 idx = 0;
-    struct cpu_load *prev_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, prev_cpu);
+    const struct cpu_load *prev_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, prev_cpu);
     if (unlikely(!prev_load)) {
         scx_bpf_error("previous CPU's percpu_load can not be referenced.");
         return -1;
     }
-    struct cpu_load *this_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, this_cpu);
+    const struct cpu_load *this_load = bpf_map_lookup_elem(&percpu_load, &idx);
     if (unlikely(!this_load)) {
         scx_bpf_error("previous CPU's percpu_load can not be referenced.");
         return -1;
@@ -468,20 +457,19 @@ void BPF_STRUCT_OPS(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     }
     if (task_on_rq_migrating(p)) {
         update_load_avg(cpu_load, p_ctx, DO_ATTACH);
-        cpu_load->weight += p_ctx->weight;
+        __sync_fetch_and_add(&cpu_load->weight, p_ctx->weight);
 
         u64 *cpu_vtime_now = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
         if (unlikely(!cpu_vtime_now)) {
             scx_bpf_error("target CPU's vtime_now can not be referenced.");
             return ;
         }
-        // if (p_ctx->avg_slice < LC_APP_SLICE_THRESH) {
-        //     if (likely(*cpu_vtime_now >= DEFAULT_SLICE_NS))
-        //         vtime += *cpu_vtime_now - DEFAULT_SLICE_NS;
-        // } else {
-        //     vtime += *cpu_vtime_now;
-        // }
-        vtime += *cpu_vtime_now - DEFAULT_SLICE_NS;
+        if (p_ctx->avg.load_avg < LC_APP_LOAD_THRESH) {
+            vtime += *cpu_vtime_now - DEFAULT_SLICE_NS;
+        } else {
+            vtime += *cpu_vtime_now;
+        }
+        // vtime += *cpu_vtime_now - DEFAULT_SLICE_NS;
     } else {
         update_load_avg(cpu_load, p_ctx, 0);
     }
@@ -533,10 +521,11 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
         scx_bpf_error("this_load can not be referenced.");
         return ;
     }
+    const u64 now = scx_bpf_now();
     if (unlikely(nr_cpu_ids == 1)) {
         goto run_prev_again;
     }
- //    const u64 now = bpf_ktime_get_ns();
+ //    const u64 now = scx_bpf_now();
  //    if (now - this_load->last_balance_time < BALANCE_INTERVAL_NS) {
  //        goto run_prev_again;
  //    }
@@ -569,7 +558,6 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
  //        goto run_prev_again;
  //    }
 
-    const u64 now = bpf_ktime_get_ns();
     if (now - this_load->last_balance_time < BALANCE_INTERVAL_NS) {
         goto run_prev_again;
     }
@@ -630,7 +618,7 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
 
 	struct task_struct *p;
 	while ((p = bpf_iter_scx_dsq_next(&iter))) {
-        // skip other schedulers' tasks(SCHED_DEADLINE/SCHED_FIFO/SCHED_RR)
+        // skip if the task can not run in this cpu
         if (p->nr_cpus_allowed == 1 || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
             continue;
         }
@@ -648,18 +636,12 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
         const u64 target_eff_load = (target_load->avg.load_avg - p_load_avg) * target_rq->cpu_capacity;
         const u64 this_eff_load = (this_load->avg.load_avg + p_load_avg) * this_rq->cpu_capacity;
         // task is still hot
-        if (target_load->prev == p
-            && now - p_ctx->last_balance_time < BALANCE_INTERVAL_NS) {
-            continue;
-        }
-        if (target_eff_load < this_eff_load
-            || p_ctx->avg_slice < LC_APP_SLICE_THRESH 
+        if ((target_load->prev == p/*  && now - p_ctx->last_balance_time < BALANCE_PREV_INTERVAL_NS */)
+            || target_eff_load < this_eff_load
             || p_ctx->avg.load_avg < LC_APP_LOAD_THRESH) {
             continue;
         }
-        // if (!scx_bpf_dsq_move_vtime(&iter, p, cpu, p_ctx->enq_flags))
-        //     continue;
-        if (!scx_bpf_dsq_move(&iter, p, SCX_DSQ_LOCAL_ON | cpu, p_ctx->enq_flags))
+        if (unlikely(!__COMPAT_scx_bpf_dsq_move(&iter, p, SCX_DSQ_LOCAL_ON | cpu, p_ctx->enq_flags)))
             continue;
 
         p_ctx->last_balance_time = now;
@@ -670,7 +652,6 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
             bpf_iter_scx_dsq_destroy(&iter);
             return ;
         }
-        // bpf_printk("move %s[%d] from CPU%d[nr %d] to CPU%d[nr %d].", p->comm, p->pid, target_cpu, scx_bpf_dsq_nr_queued(target_cpu) + 1, cpu, scx_bpf_dsq_nr_queued(cpu));
 
         u64 vtime = p->scx.dsq_vtime;
         sub_positive(&vtime, *vtime_now_prev);
@@ -679,9 +660,11 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
         update_load_avg(target_load, p_ctx, DO_DETACH);
         sub_positive(&target_load->weight, p_ctx->weight);
         update_load_avg(this_load, p_ctx, DO_ATTACH);
-        this_load->weight += p_ctx->weight;
-        scx_bpf_dsq_move_to_local(cpu);
-        
+        __sync_fetch_and_add(&this_load->weight, p_ctx->weight);
+        // if (unlikely(!scx_bpf_dsq_move_to_local(cpu))) {
+        //     update_load_avg(this_load, p_ctx, DO_DETACH);
+        //     sub_positive(&this_load->weight, p_ctx->weight);
+        // }
         bpf_iter_scx_dsq_destroy(&iter);
         __sync_lock_test_and_set(&max_load->selecting, 0);
         return ;
@@ -712,7 +695,7 @@ void BPF_STRUCT_OPS(eevdf_runnable, struct task_struct *p, u64 enq_flags)
     // Not always attaching, only the task on a new CPU will do it.
     // See `update_load_avg` DO_ATTACH comment.
     update_load_avg(cpu_load, p_ctx, DO_ATTACH);
-    cpu_load->weight += p_ctx->weight;
+    __sync_fetch_and_add(&cpu_load->weight, p_ctx->weight);
 
     u64 *cpu_vtime_now = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
     if (unlikely(!cpu_vtime_now)) {
@@ -720,13 +703,12 @@ void BPF_STRUCT_OPS(eevdf_runnable, struct task_struct *p, u64 enq_flags)
         return ;
     }
 
-    // if (p_ctx->avg_slice < LC_APP_SLICE_THRESH) {
-    //     if (likely(*cpu_vtime_now >= SCX_SLICE_DFL))
-    //         p->scx.dsq_vtime += *cpu_vtime_now - SCX_SLICE_DFL;
-    // } else {
-    //     p->scx.dsq_vtime += *cpu_vtime_now;
-    // }
-    p->scx.dsq_vtime += *cpu_vtime_now - DEFAULT_SLICE_NS;
+    if (p_ctx->avg.load_avg < LC_APP_LOAD_THRESH) {
+        p->scx.dsq_vtime += *cpu_vtime_now - SCX_SLICE_DFL;
+    } else {
+        p->scx.dsq_vtime += *cpu_vtime_now;
+    }
+    // p->scx.dsq_vtime += *cpu_vtime_now - DEFAULT_SLICE_NS;
 
     p_ctx->runnable = true;
 }
@@ -734,8 +716,7 @@ void BPF_STRUCT_OPS(eevdf_runnable, struct task_struct *p, u64 enq_flags)
 void BPF_STRUCT_OPS(eevdf_running, struct task_struct *p)
 {
     const u32 idx = 0;
-    const s32 cpu = scx_bpf_task_cpu(p);
-    u64 *vtime_now_local = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
+    u64 *vtime_now_local = bpf_map_lookup_elem(&vtime_now, &idx);
     if (unlikely(!vtime_now_local)) {
         scx_bpf_error("vimte_now_local can not be referenced.");
         return ;
@@ -747,18 +728,17 @@ void BPF_STRUCT_OPS(eevdf_running, struct task_struct *p)
         scx_bpf_error("task_ctx can not be referenced.");
         return ;
     }
-    p_ctx->running_at = bpf_ktime_get_ns();
+    p_ctx->running_at = scx_bpf_now();
     // force the slice to be DEFAULT_SLICE_NS
-    if (unlikely(p->scx.slice > DEFAULT_SLICE_NS)) {
-        p->scx.slice = DEFAULT_SLICE_NS;
-    }
+    // if (unlikely(p->scx.slice > DEFAULT_SLICE_NS)) {
+    //     p->scx.slice = DEFAULT_SLICE_NS;
+    // }
 }
 
 void BPF_STRUCT_OPS(eevdf_stopping, struct task_struct *p, bool runnable)
 {
     const u32 idx = 0;
-    const s32 cpu = scx_bpf_task_cpu(p);
-    struct cpu_load *cpu_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, cpu);
+    struct cpu_load *cpu_load = bpf_map_lookup_elem(&percpu_load, &idx);
     if (unlikely(!cpu_load)) {
         scx_bpf_error("can not get cpu load.");
         return ;
@@ -769,54 +749,47 @@ void BPF_STRUCT_OPS(eevdf_stopping, struct task_struct *p, bool runnable)
         scx_bpf_error("task_ctx can not be referenced.");
         return ;
     }
-    u64 duration;
-    if (DEFAULT_SLICE_NS > p->scx.slice)
-        duration = DEFAULT_SLICE_NS - p->scx.slice;
-    else
-        duration = 0;
+    u64 duration = scx_bpf_now() - p_ctx->running_at;
+    // if (DEFAULT_SLICE_NS > p->scx.slice)
+    //     duration = DEFAULT_SLICE_NS - p->scx.slice;
+    // else
+    //     duration = 0;
     p->scx.dsq_vtime += duration * 100 / p->scx.weight;
-    p_ctx->avg_slice = (p_ctx->avg_slice >> 1) + (duration >> 1);
-    u64 *vtime_now_local = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
+    u64 *vtime_now_local = bpf_map_lookup_elem(&vtime_now, &idx);
     if (unlikely(!vtime_now_local)) {
         scx_bpf_error("vimte_now_local can not be referenced.");
         return ;
     }
     if (vtime_before(*vtime_now_local, p->scx.dsq_vtime))
         *vtime_now_local = p->scx.dsq_vtime;
-    if (!runnable) {
-        update_load_avg(cpu_load, p_ctx, 0);
-        sub_positive(&cpu_load->weight, p_ctx->weight);
-        sub_positive(&p->scx.dsq_vtime, *vtime_now_local);
-        p_ctx->runnable = false;
-    }
 }
 
 // Unlike ops.dequeue(), this function below will only be called when dequeue_task_scx().
-// void BPF_STRUCT_OPS(eevdf_quiescent, struct task_struct *p, u64 deq_flags)
-// {
-//     const u32 idx = 0;
-//     const s32 cpu = scx_bpf_task_cpu(p);
-//     struct cpu_load *cpu_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, cpu);
-//     if (unlikely(!cpu_load)) {
-//         scx_bpf_error("can not get cpu load.");
-//         return ;
-//     }
-//     struct task_ctx *p_ctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
-//     if (unlikely(!p_ctx)) {
-//         scx_bpf_error("[quiescent]: can not get task load.");
-//         return ;
-//     }
-//     // IMPORTANT: Don't detach it! Slept task should not be detached at all!
-//     update_load_avg(cpu_load, p_ctx, 0);
-//     sub_positive(&cpu_load->weight, p_ctx->weight);
-//     u64 *cpu_vtime_now = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
-//     if (unlikely(!cpu_vtime_now)) {
-//         scx_bpf_error("target CPU's vtime_now can not be referenced.");
-//         return ;
-//     }
-//     sub_positive(&p->scx.dsq_vtime, *cpu_vtime_now);
-//     p_ctx->runnable = false;
-// }
+void BPF_STRUCT_OPS(eevdf_quiescent, struct task_struct *p, u64 deq_flags)
+{
+    const u32 idx = 0;
+    const u32 cpu = scx_bpf_task_cpu(p);
+    struct cpu_load *cpu_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, cpu);
+    if (unlikely(!cpu_load)) {
+        scx_bpf_error("can not get cpu load.");
+        return ;
+    }
+    struct task_ctx *p_ctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if (unlikely(!p_ctx)) {
+        scx_bpf_error("[quiescent]: can not get task load.");
+        return ;
+    }
+    // IMPORTANT: Don't detach it! Slept task should not be detached at all!
+    update_load_avg(cpu_load, p_ctx, 0);
+    sub_positive(&cpu_load->weight, p_ctx->weight);
+    u64 *cpu_vtime_now = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
+    if (unlikely(!cpu_vtime_now)) {
+        scx_bpf_error("target CPU's vtime_now can not be referenced.");
+        return ;
+    }
+    sub_positive(&p->scx.dsq_vtime, *cpu_vtime_now);
+    p_ctx->runnable = false;
+}
 
 void BPF_STRUCT_OPS(eevdf_set_weight, struct task_struct *p, u32 weight)
 {
@@ -837,9 +810,11 @@ void BPF_STRUCT_OPS(eevdf_set_weight, struct task_struct *p, u32 weight)
         return ;
     }
     update_load_avg(cpu_load, p_ctx, 0);
+    sub_positive(&cpu_load->weight, p_ctx->weight);
     dequeue_load_avg(cpu_load, p_ctx);
     p_ctx->weight = weight;
     enqueue_load_avg(cpu_load, p_ctx);
+    __sync_fetch_and_add(&cpu_load->weight, p_ctx->weight);
 }
 
 void BPF_STRUCT_OPS(eevdf_enable, struct task_struct *p)
@@ -852,7 +827,6 @@ void BPF_STRUCT_OPS(eevdf_enable, struct task_struct *p)
     u64 weight = p->scx.weight;
     p_ctx->weight = weight;
     p_ctx->avg.load_avg = weight;
-    p_ctx->avg_slice = LC_APP_SLICE_THRESH;
 }
 
 s32 BPF_STRUCT_OPS(eevdf_init_task, struct task_struct *p, struct scx_init_task_args *args)
@@ -892,25 +866,33 @@ void BPF_STRUCT_OPS(eevdf_exit_task, struct task_struct *p, struct scx_exit_task
     if (unlikely(!p_ctx)) {
         return ;
     }
-    update_load_avg(cpu_load, p_ctx, DO_DETACH);
-    // bpf_task_storage_delete(&task_ctx, p);
+    // if (unlikely(p_ctx->avg.last_update_time != 0)) {
+    //     update_load_avg(cpu_load, p_ctx, DO_DETACH);
+    //     sub_positive(&cpu_load->weight, p_ctx->weight);
+    // }
+    // if (unlikely(cpu_load->weight > 0 && scx_bpf_cpu_rq(cpu)->scx.nr_running == 0)) {
+    //     __sync_lock_test_and_set(&cpu_load->weight, 0);
+    // }
+    // IMPORTANT: we have to delete the task_ctx here,
+    // or ops.dispatch will get exited tasks to dispatch.
+    bpf_task_storage_delete(&task_ctx, p);
 }
 
 void BPF_STRUCT_OPS(eevdf_tick, struct task_struct *p)
 {
-    const s32 cpu = scx_bpf_task_cpu(p);
+    // const s32 cpu = scx_bpf_task_cpu(p);
     const u32 idx = 0;
-    struct cpu_load *cpu_load = bpf_map_lookup_percpu_elem(&percpu_load, &idx, cpu);
+    struct cpu_load *cpu_load = bpf_map_lookup_elem(&percpu_load, &idx);
     if (!cpu_load) {
         scx_bpf_error("can not get cpu load.");
         return ;
     }
-    struct task_ctx *p_load = bpf_task_storage_get(&task_ctx, p, 0, 0);
-    if (!p_load) {
+    struct task_ctx *p_ctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if (!p_ctx) {
         scx_bpf_error("can not get task_ctx.");
         return ;
     }
-    update_load_avg(cpu_load, p_load, 0);
+    update_load_avg(cpu_load, p_ctx, 0);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(eevdf_init)
@@ -931,7 +913,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(eevdf_init)
         }
         *vtime_now_local = DEFAULT_SLICE_NS;
         __sync_lock_test_and_set(&cpu_load_local->selecting, 0);
-        cpu_load_local->weight = 0;
+        __sync_lock_test_and_set(&cpu_load_local->weight, 0);
         cpu_load_local->prev = NULL;
         cpu_load_local->avg.load_avg = 0;
         cpu_load_local->avg.load_sum = 0;
@@ -957,7 +939,7 @@ SCX_OPS_DEFINE(eevdf_ops,
            .runnable        = (void *)eevdf_runnable,
            .running         = (void *)eevdf_running,
            .stopping        = (void *)eevdf_stopping,
-           // .quiescent       = (void *)eevdf_quiescent,
+           .quiescent       = (void *)eevdf_quiescent,
            .set_weight      = (void *)eevdf_set_weight,
            .enable          = (void *)eevdf_enable,
            .init_task       = (void *)eevdf_init_task,
@@ -965,6 +947,7 @@ SCX_OPS_DEFINE(eevdf_ops,
            .tick            = (void *)eevdf_tick,
            .init            = (void *)eevdf_init,
            .exit            = (void *)eevdf_exit,
+           // .root_cgroup_path = "/",
            .name            = "eevdf");
 
     // cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
@@ -1066,7 +1049,7 @@ SCX_OPS_DEFINE(eevdf_ops,
 	//     scx_bpf_error("this_load can not be referenced.");
  //        return ;
 	// }
- //    u64 now = bpf_ktime_get_ns();
+ //    u64 now = scx_bpf_now();
  //    if (now - this_load->last_balance_time < BALANCE_INTERVAL_NS) {
  //        return ;
  //    }

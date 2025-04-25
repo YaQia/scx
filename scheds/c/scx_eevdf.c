@@ -16,6 +16,7 @@ struct load_avg {
 
 struct cpu_load {
 	bool selecting;
+	struct bpf_spin_lock weight_lock;
 	u64 weight;
 	u64 last_balance_time;
 	struct task_struct *prev;
@@ -58,7 +59,7 @@ restart:
 		if (ret < 0)
 		    continue;
 		for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
-		    printf("CPU %d:\tload = %ld\tvtime = %ld\n", cpu, loads[cpu].avg.load_avg, vtimes[cpu]);
+		    printf("CPU %d:\tload_avg = %ld\tweight = %ld\n", cpu, loads[cpu].avg.load_avg, loads[cpu].weight);
 		}
 		fflush(stdout);
 		sleep(1);
