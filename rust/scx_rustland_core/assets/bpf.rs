@@ -23,9 +23,6 @@ use anyhow::Result;
 
 use plain::Plain;
 
-use libbpf_rs::skel::OpenSkel;
-use libbpf_rs::skel::Skel;
-use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
 
@@ -35,8 +32,6 @@ use libc::{pthread_self, pthread_setschedparam, sched_param};
 use libc::timespec;
 
 use scx_utils::compat;
-use scx_utils::import_enums;
-use scx_utils::scx_enums;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
@@ -82,6 +77,7 @@ pub struct QueuedTask {
     pub pid: i32,              // pid that uniquely identifies a task
     pub cpu: i32,              // CPU where the task is running
     pub flags: u64,            // task enqueue flags
+    pub exec_runtime: u64,     // Total cpu time since last sleep
     pub sum_exec_runtime: u64, // Total cpu time
     pub nvcsw: u64,            // Total amount of voluntary context switches
     pub weight: u64,           // Task static priority
@@ -147,6 +143,7 @@ impl EnqueuedMessage {
             pid: self.inner.pid,
             cpu: self.inner.cpu,
             flags: self.inner.flags,
+            exec_runtime: self.inner.exec_runtime,
             sum_exec_runtime: self.inner.sum_exec_runtime,
             nvcsw: self.inner.nvcsw,
             weight: self.inner.weight,
@@ -198,6 +195,7 @@ impl<'cb> BpfScheduler<'cb> {
         exit_dump_len: u32,
         partial: bool,
         debug: bool,
+        builtin_idle: bool,
     ) -> Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         set_ctrlc_handler(shutdown.clone()).context("Error setting Ctrl-C handler")?;
@@ -258,6 +256,7 @@ impl<'cb> BpfScheduler<'cb> {
         skel.struct_ops.rustland_mut().exit_dump_len = exit_dump_len;
 
         skel.maps.bss_data.usersched_pid = std::process::id();
+        skel.maps.rodata_data.builtin_idle = builtin_idle;
         skel.maps.rodata_data.debug = debug;
 
         // Attach BPF scheduler.

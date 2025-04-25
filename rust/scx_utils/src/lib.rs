@@ -30,6 +30,7 @@
 //! Utility modules which can be useful for userspace component of sched_ext
 //! schedulers.
 
+pub use log::info;
 pub use log::warn;
 pub use paste::paste;
 
@@ -70,7 +71,13 @@ pub use topology::Topology;
 pub use topology::NR_CPUS_POSSIBLE;
 pub use topology::NR_CPU_IDS;
 
+mod energy_model;
+pub use energy_model::EnergyModel;
+pub use energy_model::PerfDomain;
+pub use energy_model::PerfState;
+
 mod cpumask;
+pub use cpumask::read_cpulist;
 pub use cpumask::Cpumask;
 
 mod gpu;
@@ -78,6 +85,8 @@ mod gpu;
 mod infeasible;
 pub use infeasible::LoadAggregator;
 pub use infeasible::LoadLedger;
+
+pub mod mangoapp;
 
 pub mod misc;
 pub use misc::monitor_stats;
@@ -95,3 +104,5 @@ pub use enums::scx_enums;
 
 #[cfg(feature = "autopower")]
 pub mod autopower;
+
+pub mod perf;

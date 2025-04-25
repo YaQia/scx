@@ -28,9 +28,6 @@ pub use bpf_skel::*;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
 use lazy_static::lazy_static;
-use libbpf_rs::skel::OpenSkel;
-use libbpf_rs::skel::Skel;
-use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore as _;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
@@ -41,7 +38,6 @@ use log::warn;
 use scx_layered::*;
 use scx_stats::prelude::*;
 use scx_utils::compat;
-use scx_utils::import_enums;
 use scx_utils::init_libbpf_logging;
 use scx_utils::pm::{cpu_idle_resume_latency_supported, update_cpu_idle_resume_latency};
 use scx_utils::read_netdevs;
@@ -114,6 +110,8 @@ lazy_static! {
                         preempt_first: false,
                         exclusive: false,
                         allow_node_aligned: false,
+                        skip_remote_node: false,
+                        prev_over_idle_core: false,
                         idle_smt: None,
                         slice_us: 20000,
                         fifo: false,
@@ -144,6 +142,8 @@ lazy_static! {
                         preempt_first: false,
                         exclusive: true,
                         allow_node_aligned: true,
+                        skip_remote_node: false,
+                        prev_over_idle_core: true,
                         idle_smt: None,
                         slice_us: 20000,
                         fifo: false,
@@ -178,6 +178,8 @@ lazy_static! {
                         preempt_first: false,
                         exclusive: false,
                         allow_node_aligned: false,
+                        skip_remote_node: false,
+                        prev_over_idle_core: false,
                         idle_smt: None,
                         slice_us: 800,
                         fifo: false,
@@ -209,6 +211,8 @@ lazy_static! {
                         preempt_first: false,
                         exclusive: false,
                         allow_node_aligned: false,
+                        skip_remote_node: false,
+                        prev_over_idle_core: false,
                         idle_smt: None,
                         slice_us: 20000,
                         fifo: false,
@@ -377,6 +381,10 @@ lazy_static! {
 ///   fallback. This is a hack to support node-affine tasks without making
 ///   the whole scheduler node aware and should only be used with open
 ///   layers on non-saturated machines to avoid possible stalls.
+///
+/// - prev_over_idle_core: On SMT enabled systems, prefer using the same CPU
+///   when picking a CPU for tasks on this layer, even if that CPUs SMT
+///   sibling is processing a task.
 ///
 /// - weight: Weight of the layer, which is a range from 1 to 10000 with a
 ///   default of 100. Layer weights are used during contention to prevent
@@ -582,6 +590,16 @@ struct Opts {
     #[clap(long, default_value = "false")]
     enable_gpu_support: bool,
 
+    /// Gpu Kprobe Level
+    /// The value set here determines how agressive
+    /// the kprobes enabled on gpu driver functions are.
+    /// Higher values are more aggressive, incurring more system overhead
+    /// and more accurately identifying PIDs using GPUs in a more timely manner.
+    /// Lower values incur less system overhead, at the cost of less accurately
+    /// identifying GPU pids and taking longer to do so.
+    #[clap(long, default_value = "3")]
+    gpu_kprobe_level: u64,
+
     /// Enable netdev IRQ balancing. This is experimental and should be used with caution.
     #[clap(long, default_value = "false")]
     netdev_irq_balance: bool,
@@ -600,16 +618,6 @@ struct Opts {
 
     /// Layer specification. See --help.
     specs: Vec<String>,
-}
-
-fn now_monotonic() -> u64 {
-    let mut time = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
-    assert!(ret == 0);
-    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
 }
 
 fn read_total_cpu(reader: &procfs::ProcReader) -> Result<procfs::CpuStat> {
@@ -834,37 +842,12 @@ struct Stats {
 
 impl Stats {
     fn read_layer_usages(cpu_ctxs: &[bpf_intf::cpu_ctx], nr_layers: usize) -> Vec<Vec<u64>> {
-        let now = now_monotonic();
         let mut layer_usages = vec![vec![0u64; NR_LAYER_USAGES]; nr_layers];
 
         for cpu in 0..*NR_CPUS_POSSIBLE {
             for layer in 0..nr_layers {
                 for usage in 0..NR_LAYER_USAGES {
                     layer_usages[layer][usage] += cpu_ctxs[cpu].layer_usages[layer][usage];
-                }
-            }
-        }
-
-        // layer_usages are updated at ops.stopping(). If tasks in a layer
-        // keep running, it may not update the usage stats for a long time
-        // to the point where the reported usage stats fluctuate wildly
-        // making CPU allocation oscillate. Compensate for it by adding the
-        // time spent for the currently running task.
-        //
-        // This is racy but the error range is bound. Implement seq_lock
-        // equivalent to make this fully correct. Due to the raciness, it
-        // may be possible for usage stats to go backward. Use saturating
-        // sub when calculating delta. See cur_layer_utils calculation in
-        // Stats::refresh().
-        for cpuc in cpu_ctxs {
-            let layer = cpuc.task_layer_id as usize;
-            if layer < MAX_LAYERS {
-                let usage = match cpuc.running_owned {
-                    true => LAYER_USAGE_OWNED,
-                    false => LAYER_USAGE_OPEN,
-                };
-                if now > cpuc.running_at {
-                    layer_usages[layer][usage] += now - cpuc.running_at;
                 }
             }
         }
@@ -931,14 +914,13 @@ impl Stats {
             .collect();
 
         let cur_layer_usages = Self::read_layer_usages(&cpu_ctxs, self.nr_layers);
-        // See read_layer_usages() on why saturating_sub is used below.
         let cur_layer_utils: Vec<Vec<f64>> = cur_layer_usages
             .iter()
             .zip(self.prev_layer_usages.iter())
             .map(|(cur, prev)| {
                 cur.iter()
                     .zip(prev.iter())
-                    .map(|(c, p)| (c.saturating_sub(*p)) as f64 / 1_000_000_000.0 / elapsed_f64)
+                    .map(|(c, p)| (c - p) as f64 / 1_000_000_000.0 / elapsed_f64)
                     .collect()
             })
             .collect();
@@ -973,8 +955,11 @@ impl Stats {
             nr_layer_tasks,
             nr_nodes: self.nr_nodes,
 
-            total_util: layer_utils.iter().flatten().sum(),
-            layer_utils: layer_utils,
+            total_util: layer_utils
+                .iter()
+                .map(|x| x.iter().take(LAYER_USAGE_SUM_UPTO + 1).sum::<f64>())
+                .sum(),
+            layer_utils,
             prev_layer_usages: cur_layer_usages,
 
             cpu_busy,
@@ -1328,6 +1313,8 @@ impl<'a> Scheduler<'a> {
                     preempt_first,
                     exclusive,
                     allow_node_aligned,
+                    skip_remote_node,
+                    prev_over_idle_core,
                     growth_algo,
                     nodes,
                     slice_us,
@@ -1356,6 +1343,8 @@ impl<'a> Scheduler<'a> {
                 layer.preempt_first.write(*preempt_first);
                 layer.exclusive.write(*exclusive);
                 layer.allow_node_aligned.write(*allow_node_aligned);
+                layer.skip_remote_node.write(*skip_remote_node);
+                layer.prev_over_idle_core.write(*prev_over_idle_core);
                 layer.growth_algo = growth_algo.as_bpf_enum();
                 layer.weight = *weight;
                 layer.disallow_open_after_ns = match disallow_open_after_us.unwrap() {
@@ -1794,9 +1783,19 @@ impl<'a> Scheduler<'a> {
         // enable autoloads for conditionally loaded things
         // immediately after creating skel (because this is always before loading)
         if opts.enable_gpu_support {
-            compat::cond_kprobe_enable("nvidia_open", &skel.progs.kprobe_nvidia_open)?;
-            compat::cond_kprobe_enable("nvidia_poll", &skel.progs.kprobe_nvidia_poll)?;
-            compat::cond_kprobe_enable("nvidia_mmap", &skel.progs.kprobe_nvidia_mmap)?;
+            // by default, enable open if gpu support is enabled.
+            // open has been observed to be relatively cheap to kprobe.
+            if opts.gpu_kprobe_level >= 1 {
+                compat::cond_kprobe_enable("nvidia_open", &skel.progs.kprobe_nvidia_open)?;
+            }
+            // enable the rest progressively based upon how often they are called
+            // for observed workloads
+            if opts.gpu_kprobe_level >= 2 {
+                compat::cond_kprobe_enable("nvidia_mmap", &skel.progs.kprobe_nvidia_mmap)?;
+            }
+            if opts.gpu_kprobe_level >= 3 {
+                compat::cond_kprobe_enable("nvidia_poll", &skel.progs.kprobe_nvidia_poll)?;
+            }
         }
 
         skel.maps.rodata_data.slice_ns = scx_enums.SCX_SLICE_DFL;
@@ -1902,7 +1901,7 @@ impl<'a> Scheduler<'a> {
 
         let mut layers = vec![];
         let layer_growth_orders =
-            LayerGrowthAlgo::layer_core_orders(&cpu_pool, &layer_specs, &topo);
+            LayerGrowthAlgo::layer_core_orders(&cpu_pool, &layer_specs, &topo)?;
         for (idx, spec) in layer_specs.iter().enumerate() {
             let growth_order = layer_growth_orders
                 .get(&idx)

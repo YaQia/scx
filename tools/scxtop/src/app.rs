@@ -25,9 +25,10 @@ use crate::APP;
 use crate::LICENSE;
 use crate::SCHED_NAME_PATH;
 use crate::{
-    Action, CpuhpAction, ExecAction, ForkAction, GpuMemAction, HwPressureAction, IPIAction,
-    SchedCpuPerfSetAction, SchedSwitchAction, SchedWakeupAction, SchedWakingAction, SoftIRQAction,
-    TraceStartedAction, TraceStoppedAction,
+    Action, CpuhpEnterAction, CpuhpExitAction, ExecAction, ExitAction, ForkAction, GpuMemAction,
+    HwPressureAction, IPIAction, MangoAppAction, PstateSampleAction, SchedCpuPerfSetAction,
+    SchedSwitchAction, SchedWakeupAction, SchedWakingAction, SoftIRQAction, TraceStartedAction,
+    TraceStoppedAction,
 };
 
 use anyhow::Result;
@@ -35,7 +36,6 @@ use glob::glob;
 use libbpf_rs::Link;
 use libbpf_rs::ProgramInput;
 use num_format::{SystemLocale, ToFormattedString};
-use protobuf::Message;
 use ratatui::prelude::Constraint;
 use ratatui::{
     layout::{Alignment, Direction, Layout, Rect},
@@ -50,7 +50,7 @@ use ratatui::{
 };
 use regex::Regex;
 use scx_stats::prelude::StatsClient;
-use scx_utils::misc::read_file_usize;
+use scx_utils::misc::read_from_file;
 use scx_utils::scx_enums;
 use scx_utils::Topology;
 use serde_json::Value as JsonValue;
@@ -58,6 +58,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 
 use std::collections::BTreeMap;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -68,6 +69,7 @@ const DSQ_VTIME_CUTOFF: u64 = 1_000_000_000_000_000;
 /// App is the struct for scxtop application state.
 pub struct App<'a> {
     config: Config,
+    hw_pressure: bool,
     localize: bool,
     locale: SystemLocale,
     stats_client: Arc<Mutex<StatsClient>>,
@@ -86,6 +88,7 @@ pub struct App<'a> {
     large_core_count: bool,
     collect_cpu_freq: bool,
     collect_uncore_freq: bool,
+    pstate: bool,
     event_scroll_state: ScrollbarState,
     event_scroll: u16,
 
@@ -114,7 +117,13 @@ pub struct App<'a> {
     trace_start: u64,
     prev_bpf_sample_rate: u32,
     process_id: i32,
+    prev_process_id: i32,
     trace_links: Vec<Link>,
+
+    // mangoapp related
+    last_mangoapp_action: Option<MangoAppAction>,
+    frames_since_update: u64,
+    max_fps: u16,
 }
 
 impl<'a> App<'a> {
@@ -192,9 +201,14 @@ impl<'a> App<'a> {
         let trace_file_prefix = config.trace_file_prefix().to_string();
         let trace_manager = PerfettoTraceManager::new(trace_file_prefix, None);
 
+        // There isn't a 'is_loaded' method on a prog in libbpf-rs so do the next best thing and
+        // try to infer from the fd
+        let hw_pressure = skel.progs.on_hw_pressure_update.as_fd().as_raw_fd() > 0;
+
         let app = Self {
             config,
             localize: true,
+            hw_pressure,
             locale: SystemLocale::default()?,
             stats_client: Arc::new(Mutex::new(stats_client)),
             sched_stats_raw: "".to_string(),
@@ -211,6 +225,7 @@ impl<'a> App<'a> {
             topo,
             collect_cpu_freq: true,
             collect_uncore_freq: true,
+            pstate: true,
             cpu_data,
             llc_data,
             node_data,
@@ -231,7 +246,11 @@ impl<'a> App<'a> {
             trace_manager,
             bpf_stats: Default::default(),
             process_id,
+            prev_process_id: -1,
             trace_links: vec![],
+            last_mangoapp_action: None,
+            frames_since_update: 0,
+            max_fps: 1,
         };
 
         Ok(app)
@@ -246,6 +265,14 @@ impl<'a> App<'a> {
     pub fn set_state(&mut self, state: AppState) {
         self.prev_state = self.state.clone();
         self.state = state;
+        if self.prev_state == AppState::MangoApp {
+            self.process_id = self.prev_process_id;
+            // reactivate the prev perf event with the previous pid
+            let perf_event = &self.available_events[self.active_hw_event_id].clone();
+            let _ = self.activate_perf_event(perf_event);
+            self.max_fps = 1;
+            self.frames_since_update = 0;
+        }
     }
 
     /// Returns the current theme of the application
@@ -322,7 +349,7 @@ impl<'a> App<'a> {
                 *cpu_id
             );
             let path = Path::new(&file);
-            let freq = read_file_usize(path).unwrap_or(0);
+            let freq = read_from_file(path).unwrap_or(0_usize);
             let cpu_data = self.cpu_data.entry(*cpu_id).or_insert(CpuData::new(
                 *cpu_id,
                 0,
@@ -353,7 +380,7 @@ impl<'a> App<'a> {
                     re.captures(raw_path.to_str().expect("failed to get str from path"))
                 {
                     let package_id: usize = caps[1].parse().unwrap();
-                    let uncore_freq = read_file_usize(path).unwrap_or(0);
+                    let uncore_freq = read_from_file(path).unwrap_or(0_usize);
                     for cpu in self.topo.all_cpus.values() {
                         if cpu.package_id != package_id {
                             continue;
@@ -516,7 +543,7 @@ impl<'a> App<'a> {
         Bar::default()
             .value(value)
             .label(Line::from(format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 cpu,
                 if self.collect_cpu_freq {
                     format!(
@@ -532,7 +559,19 @@ impl<'a> App<'a> {
                 } else {
                     "".to_string()
                 },
-                if hw_pressure > 0 {
+                if self.pstate {
+                    format!(
+                        " {}",
+                        cpu_data
+                            .event_data_immut("pstate")
+                            .last()
+                            .copied()
+                            .unwrap_or(0)
+                    )
+                } else {
+                    "".to_string()
+                },
+                if self.hw_pressure && hw_pressure > 0 {
                     format!("{}", hw_pressure)
                 } else {
                     "".to_string()
@@ -550,6 +589,7 @@ impl<'a> App<'a> {
         let mut perf: u64 = 0;
         let mut cpu_freq: u64 = 0;
         let mut hw_pressure: u64 = 0;
+        let mut pstate: u64 = 0;
         let data = if self.cpu_data.contains_key(&cpu) {
             let cpu_data = self.cpu_data.get(&cpu).unwrap();
             perf = cpu_data
@@ -564,11 +604,20 @@ impl<'a> App<'a> {
                     .copied()
                     .unwrap_or(0);
             }
-            hw_pressure = cpu_data
-                .event_data_immut("hw_pressure")
-                .last()
-                .copied()
-                .unwrap_or(0);
+            if self.pstate {
+                pstate = cpu_data
+                    .event_data_immut("pstate")
+                    .last()
+                    .copied()
+                    .unwrap_or(0);
+            }
+            if self.hw_pressure {
+                hw_pressure = cpu_data
+                    .event_data_immut("hw_pressure")
+                    .last()
+                    .copied()
+                    .unwrap_or(0);
+            }
             cpu_data.event_data_immut(self.active_event.event_name())
         } else {
             Vec::new()
@@ -587,14 +636,22 @@ impl<'a> App<'a> {
                         if perf == 0 {
                             "".to_string()
                         } else {
-                            format!("{}", perf)
+                            format!(
+                                "{}{}",
+                                perf,
+                                if self.pstate {
+                                    format!("/{}", pstate)
+                                } else {
+                                    "".to_string()
+                                }
+                            )
                         },
                         if self.collect_cpu_freq {
                             format!(" {}", format_hz(cpu_freq))
                         } else {
                             "".to_string()
                         },
-                        if hw_pressure > 0 {
+                        if self.hw_pressure && hw_pressure > 0 {
                             format!(" hw_pressure({})", hw_pressure)
                         } else {
                             "".to_string()
@@ -2063,11 +2120,75 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    /// Handles MangoApp pressure events.
+    pub fn on_mangoapp(&mut self, action: &MangoAppAction) -> Result<()> {
+        self.last_mangoapp_action = Some(action.clone());
+        // Update the perf event to the mangoapp event
+        if action.pid as i32 != self.process_id && action.pid > 0 {
+            self.prev_process_id = self.process_id;
+            self.process_id = action.pid as i32;
+            // reactivate the active perf event with the pid from mangoapp
+            let perf_event = &self.available_events[self.active_hw_event_id].clone();
+            let _ = self.activate_perf_event(perf_event);
+        }
+        Ok(())
+    }
+
+    /// Renders the mangoapp TUI.
+    fn render_mangoapp(&mut self, frame: &mut Frame) -> Result<()> {
+        let [left, right] = Layout::horizontal([Constraint::Fill(1); 2]).areas(frame.area());
+
+        let left_constraints = vec![
+            Constraint::Percentage(2),
+            Constraint::Percentage(49),
+            Constraint::Percentage(49),
+        ];
+        let left_areas = Layout::vertical(left_constraints).split(left);
+        let theme = self.theme();
+
+        let mut comm = if self.process_id > 0 {
+            read_file_string(&format!("/proc/{}/comm", self.process_id)).unwrap_or("".to_string())
+        } else {
+            "".to_string()
+        };
+        comm = comm.trim_end().to_string();
+        let last_action = self.last_mangoapp_action.clone();
+
+        let block = Block::new()
+            .title_top(
+                Line::from(if let Some(action) = last_action {
+                    format!(
+                        "{}:{} {}x{}:{}",
+                        comm,
+                        self.process_id,
+                        action.output_width,
+                        action.output_height,
+                        action.display_refresh,
+                    )
+                } else {
+                    "mangoapp not available".to_string()
+                })
+                .style(theme.title_style())
+                .centered(),
+            )
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(theme.border_style());
+
+        self.render_event(frame, right)?;
+        frame.render_widget(block, left_areas[0]);
+        self.render_scheduler("dsq_lat_us", frame, left_areas[1], true, true)?;
+        self.render_scheduler("dsq_slice_consumed", frame, left_areas[2], true, false)?;
+
+        Ok(())
+    }
+
     /// Renders the application to the frame.
     pub fn render(&mut self, frame: &mut Frame) -> Result<()> {
         match self.state {
             AppState::Help => self.render_help(frame),
             AppState::Event => self.render_event_list(frame),
+            AppState::MangoApp => self.render_mangoapp(frame),
             AppState::Node => self.render_node(frame),
             AppState::Llc => self.render_llc(frame),
             AppState::Scheduler => {
@@ -2150,6 +2271,7 @@ impl<'a> App<'a> {
             self.skel.progs.on_ipi_send_cpu.attach()?,
             self.skel.progs.on_sched_fork.attach()?,
             self.skel.progs.on_sched_exec.attach()?,
+            self.skel.progs.on_sched_exit.attach()?,
         ];
 
         Ok(())
@@ -2276,9 +2398,27 @@ impl<'a> App<'a> {
         cpu_data.add_event_data("perf", perf as u64);
     }
 
+    fn on_pstate_sample(&mut self, action: &PstateSampleAction) {
+        let PstateSampleAction { cpu, busy } = action;
+        let cpu_data = self.cpu_data.entry(*cpu as usize).or_insert(CpuData::new(
+            *cpu as usize,
+            0,
+            0,
+            0,
+            self.max_cpu_events,
+        ));
+        cpu_data.add_event_data("pstate", *busy as u64);
+    }
+
     fn on_exec(&mut self, action: &ExecAction) {
         if self.state == AppState::Tracing && action.ts > self.trace_start {
             self.trace_manager.on_exec(action);
+        }
+    }
+
+    fn on_exit(&mut self, action: &ExitAction) {
+        if self.state == AppState::Tracing && action.ts > self.trace_start {
+            self.trace_manager.on_exit(action);
         }
     }
 
@@ -2332,12 +2472,27 @@ impl<'a> App<'a> {
         ));
 
         if *next_dsq_id != scx_enums.SCX_DSQ_INVALID && *next_dsq_lat_us > 0 {
-            cpu_data.add_event_data("dsq_lat_us", *next_dsq_lat_us);
+            if self.state == AppState::MangoApp {
+                if self.process_id > 0 && action.next_tgid == self.process_id as u32 {
+                    cpu_data.add_event_data("dsq_lat_us", *next_dsq_lat_us);
+                }
+            } else {
+                cpu_data.add_event_data("dsq_lat_us", *next_dsq_lat_us);
+            }
+
             let next_dsq_data = self
                 .dsq_data
                 .entry(*next_dsq_id)
                 .or_insert(EventData::new(self.max_cpu_events));
-            next_dsq_data.add_event_data("dsq_lat_us", *next_dsq_lat_us);
+
+            if self.state == AppState::MangoApp {
+                if self.process_id > 0 && action.next_tgid == self.process_id as u32 {
+                    next_dsq_data.add_event_data("dsq_lat_us", *next_dsq_lat_us);
+                }
+            } else {
+                next_dsq_data.add_event_data("dsq_lat_us", *next_dsq_lat_us);
+            }
+
             if *next_dsq_vtime > 0 {
                 // vtime is special because we want the delta
                 let last = next_dsq_data
@@ -2359,7 +2514,13 @@ impl<'a> App<'a> {
                 .dsq_data
                 .entry(*prev_dsq_id)
                 .or_insert(EventData::new(self.max_cpu_events));
-            prev_dsq_data.add_event_data("dsq_slice_consumed", *prev_used_slice_ns);
+            if self.state == AppState::MangoApp {
+                if self.process_id > 0 && action.prev_tgid == self.process_id as u32 {
+                    prev_dsq_data.add_event_data("dsq_slice_consumed", *prev_used_slice_ns);
+                }
+            } else {
+                prev_dsq_data.add_event_data("dsq_slice_consumed", *prev_used_slice_ns);
+            }
         }
     }
 
@@ -2384,9 +2545,15 @@ impl<'a> App<'a> {
     }
 
     /// Handles cpu hotplug events.
-    pub fn on_cpu_hp(&mut self, action: &CpuhpAction) {
+    pub fn on_cpu_hp_enter(&mut self, action: &CpuhpEnterAction) {
         if self.state == AppState::Tracing && action.ts > self.trace_start {
-            self.trace_manager.on_cpu_hp(action);
+            self.trace_manager.on_cpu_hp_enter(action);
+        }
+    }
+
+    pub fn on_cpu_hp_exit(&mut self, action: &CpuhpExitAction) {
+        if self.state == AppState::Tracing && action.ts > self.trace_start {
+            self.trace_manager.on_cpu_hp_exit(action);
         }
     }
 
@@ -2440,6 +2607,9 @@ impl<'a> App<'a> {
                 }
             }
             Action::NextViewState => self.next_view_state(),
+            Action::PstateSample(a) => {
+                self.on_pstate_sample(a);
+            }
             Action::SchedReg => {
                 self.on_scheduler_load()?;
             }
@@ -2486,17 +2656,26 @@ impl<'a> App<'a> {
             Action::Exec(a) => {
                 self.on_exec(a);
             }
+            Action::Exit(a) => {
+                self.on_exit(a);
+            }
             Action::Fork(a) => {
                 self.on_fork(a);
             }
             Action::IPI(a) => {
                 self.on_ipi(a);
             }
+            Action::MangoApp(a) => {
+                self.on_mangoapp(a)?;
+            }
             Action::GpuMem(a) => {
                 self.on_gpu_mem(a);
             }
-            Action::Cpuhp(a) => {
-                self.on_cpu_hp(a);
+            Action::CpuhpEnter(a) => {
+                self.on_cpu_hp_enter(a);
+            }
+            Action::CpuhpExit(a) => {
+                self.on_cpu_hp_exit(a);
             }
             Action::HwPressure(a) => {
                 self.on_hw_pressure(a);
@@ -2512,6 +2691,7 @@ impl<'a> App<'a> {
             Action::ToggleCpuFreq => self.collect_cpu_freq = !self.collect_cpu_freq,
             Action::ToggleUncoreFreq => self.collect_uncore_freq = !self.collect_uncore_freq,
             Action::ToggleLocalization => self.localize = !self.localize,
+            Action::ToggleHwPressure => self.hw_pressure = !self.hw_pressure,
             Action::IncBpfSampleRate => {
                 let sample_rate = self.skel.maps.data_data.sample_rate;
                 if sample_rate == 0 {

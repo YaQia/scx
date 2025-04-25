@@ -332,15 +332,18 @@ impl BpfBuilder {
     }
 
     pub fn compile_link_gen(&mut self) -> Result<()> {
-        let (input, name) = match &self.skel_input_name {
-            Some(pair) => pair,
+        let input = match &self.skel_input_name {
+            Some((name, _)) => name,
             None => return Ok(()),
         };
 
-        let linkobj = self.out_dir.join(format!("{}.bpf.o", name));
+        // Better to hardcode the name because it gets embedded in
+        // all the skeleton struct/member definitions.
+        let linkobj = self.out_dir.join("bpf.bpf.o");
         let mut linker = Linker::new(&linkobj)?;
 
         for filename in self.sources.iter() {
+            let name = Path::new(filename).file_name().unwrap().to_str().unwrap();
             let obj = self.out_dir.join(name.replace(".bpf.c", ".bpf.o"));
 
             let output = SkeletonBuilder::new()
@@ -362,7 +365,7 @@ impl BpfBuilder {
 
         self.bindgen_bpf_intf()?;
 
-        let skel_path = self.out_dir.join(format!("{}_skel.rs", name));
+        let skel_path = self.out_dir.join("bpf_skel.rs");
 
         SkeletonBuilder::new()
             .obj(&linkobj)
@@ -371,12 +374,12 @@ impl BpfBuilder {
             .generate(&skel_path)?;
 
         let mut deps = BTreeSet::new();
-        self.add_src_deps(&mut deps, &input)?;
+        self.add_src_deps(&mut deps, input)?;
         for filename in self.sources.iter() {
             deps.insert(filename.to_string());
         }
 
-        self.gen_cargo_reruns(Some(&mut deps))?;
+        self.gen_cargo_reruns(Some(&deps))?;
 
         Ok(())
     }
@@ -401,7 +404,7 @@ impl BpfBuilder {
             println!("cargo:warning={}", line);
         }
 
-        self.add_src_deps(deps, &input)?;
+        self.add_src_deps(deps, input)?;
 
         Ok(())
     }
@@ -466,6 +469,9 @@ mod tests {
 
     #[test]
     fn test_bpf_builder_new() {
+        let td = tempfile::tempdir().unwrap();
+        std::env::set_var("OUT_DIR", td.path());
+
         let res = super::BpfBuilder::new();
         assert!(res.is_ok(), "Failed to create BpfBuilder ({:?})", &res);
     }

@@ -42,14 +42,15 @@ impl Default for KeyMap {
         bindings.insert(Key::Char('f'), Action::ToggleCpuFreq);
         bindings.insert(Key::Char('u'), Action::ToggleUncoreFreq);
         bindings.insert(Key::Char('L'), Action::ToggleLocalization);
+        bindings.insert(Key::Char('P'), Action::ToggleHwPressure);
         bindings.insert(Key::Char('h'), Action::SetState(AppState::Help));
+        bindings.insert(Key::Char('m'), Action::SetState(AppState::MangoApp));
         bindings.insert(Key::Char('?'), Action::SetState(AppState::Help));
         bindings.insert(Key::Char('l'), Action::SetState(AppState::Llc));
         bindings.insert(Key::Char('n'), Action::SetState(AppState::Node));
         bindings.insert(Key::Char('s'), Action::SetState(AppState::Scheduler));
         bindings.insert(Key::Char('S'), Action::SaveConfig);
         bindings.insert(Key::Char('a'), Action::RequestTrace);
-        bindings.insert(Key::Char('P'), Action::RequestTrace);
         bindings.insert(Key::Char('x'), Action::ClearEvent);
         bindings.insert(Key::Char('j'), Action::PrevEvent);
         bindings.insert(Key::Char('k'), Action::NextEvent);
@@ -343,8 +344,10 @@ pub fn parse_action(action_str: &str) -> Result<Action> {
         "ToggleCpuFreq" => Ok(Action::ToggleCpuFreq),
         "ToggleUncoreFreq" => Ok(Action::ToggleUncoreFreq),
         "ToggleLocalization" => Ok(Action::ToggleLocalization),
+        "ToggleHwPressure" => Ok(Action::ToggleHwPressure),
         "AppStateHelp" => Ok(Action::SetState(AppState::Help)),
         "AppStateLlc" => Ok(Action::SetState(AppState::Llc)),
+        "AppStateMangoApp" => Ok(Action::SetState(AppState::MangoApp)),
         "AppStateNode" => Ok(Action::SetState(AppState::Node)),
         "AppStateScheduler" => Ok(Action::SetState(AppState::Scheduler)),
         "SaveConfig" => Ok(Action::SaveConfig),

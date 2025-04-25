@@ -405,6 +405,23 @@ int BPF_KPROBE(scx_dispatch_from_dsq_set_vtime, struct bpf_iter_scx_dsq *it__ite
 	return on_move_set_vtime(NULL, vtime);
 }
 
+static void record_real_comm(char *comm, struct task_struct *task)
+{
+	if (task->flags & PF_WQ_WORKER) {
+		/*
+		 * Worker queue thread names are 32 characters long but let's
+		 * stick with the measly 16 characters of the comm field to
+		 * keep things simple.
+		 */
+		struct kthread *k = bpf_core_cast(task->worker_private,
+						  struct kthread);
+		struct worker *worker = bpf_core_cast(k->data, struct worker);
+		bpf_probe_read_kernel_str(comm, MAX_COMM, worker->desc);
+	} else {
+		__builtin_memcpy_inline(comm, &task->comm, MAX_COMM);
+	}
+}
+
 static __always_inline int __on_sched_wakeup(struct task_struct *p)
 {
 	struct task_ctx *tctx;
@@ -427,8 +444,10 @@ static __always_inline int __on_sched_wakeup(struct task_struct *p)
 	event->ts = now;
 	event->cpu = bpf_get_smp_processor_id();
 	event->event.wakeup.pid = p->pid;
+	event->event.wakeup.tgid = p->tgid;
 	event->event.wakeup.prio = (int)p->prio;
-	__builtin_memcpy_inline(&event->event.wakeup.comm, &p->comm, MAX_COMM);
+	record_real_comm(event->event.wakeup.comm, p);
+
 	bpf_ringbuf_submit(event, 0);
 
 	return 0;
@@ -451,16 +470,19 @@ int BPF_PROG(on_sched_waking, struct task_struct *p)
 {
 	struct bpf_event *event;
 
-	event = bpf_ringbuf_reserve(&events, sizeof(struct bpf_event), 0);
-	if (!event)
-		return 0;
+        if (!enable_bpf_events || !should_sample())
+                return 0;
+
+        if (!(event = try_reserve_event()))
+                return -ENOMEM;
 
 	event->type = SCHED_WAKING;
 	event->ts = bpf_ktime_get_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	event->event.wakeup.pid = p->pid;
+	event->event.wakeup.tgid = p->tgid;
 	event->event.wakeup.prio = (int)p->prio;
-	__builtin_memcpy(&event->event.wakeup.comm, &p->comm, MAX_COMM);
+	record_real_comm(event->event.wakeup.comm, p);
 
 	bpf_ringbuf_submit(event, 0);
 	return 0;
@@ -520,7 +542,7 @@ int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev,
 			event->event.sched_switch.next_dsq_nr = 0;
 			event->event.sched_switch.next_dsq_vtime = 0;
 		}
-		__builtin_memcpy(&event->event.sched_switch.next_comm, &next->comm, MAX_COMM);
+		record_real_comm(event->event.sched_switch.next_comm, next);
 	} else {
 		event->event.sched_switch.next_pid = 0;
 		event->event.sched_switch.next_tgid = 0;
@@ -538,7 +560,7 @@ int BPF_PROG(on_sched_switch, bool preempt, struct task_struct *prev,
 		} else {
 			event->event.sched_switch.prev_dsq_id = SCX_DSQ_INVALID;
 		}
-		__builtin_memcpy(&event->event.sched_switch.prev_comm, &prev->comm, MAX_COMM);
+		record_real_comm(event->event.sched_switch.prev_comm, prev);
 	} else {
 		event->event.sched_switch.prev_pid = 0;
 		event->event.sched_switch.prev_tgid = 0;
@@ -782,6 +804,30 @@ int BPF_PROG(on_ipi_send_cpu, u32 cpu, void *callsite, void *callback)
 	return 0;
 }
 
+SEC("tp_btf/sched_process_exit")
+int BPF_PROG(on_sched_exit, struct task_struct *task)
+{
+	struct bpf_event *event;
+
+	if (!enable_bpf_events || !should_sample())
+		return 0;
+
+	if (!(event = try_reserve_event()))
+		return -ENOMEM;
+
+	event->type = EXIT;
+	event->cpu = bpf_get_smp_processor_id();
+	event->ts = bpf_ktime_get_ns();
+	event->event.exit.pid = BPF_CORE_READ(task, pid);
+	event->event.exit.tgid = BPF_CORE_READ(task, tgid);
+	event->event.exit.prio = BPF_CORE_READ(task, prio);
+	record_real_comm(event->event.exit.comm, task);
+
+	bpf_ringbuf_submit(event, 0);
+
+	return 0;
+}
+
 SEC("tp_btf/sched_process_fork")
 int BPF_PROG(on_sched_fork, struct task_struct *parent, struct task_struct *child)
 {
@@ -798,8 +844,8 @@ int BPF_PROG(on_sched_fork, struct task_struct *parent, struct task_struct *chil
 	event->ts = bpf_ktime_get_ns();
 	event->event.fork.parent_pid = BPF_CORE_READ(parent, pid);
 	event->event.fork.child_pid = BPF_CORE_READ(child, pid);
-	__builtin_memcpy_inline(&event->event.fork.parent_comm, &parent->comm, MAX_COMM);
-	__builtin_memcpy_inline(&event->event.fork.child_comm, &child->comm, MAX_COMM);
+	record_real_comm(event->event.fork.parent_comm, parent);
+	record_real_comm(event->event.fork.child_comm, child);
 
 	bpf_ringbuf_submit(event, 0);
 
@@ -817,7 +863,7 @@ int BPF_PROG(on_sched_exec, struct task_struct *p, u32 old_pid, struct linux_bin
 	if (!(event = try_reserve_event()))
 		return -ENOMEM;
 
-	event->type = FORK;
+	event->type = EXEC;
 	event->cpu = bpf_get_smp_processor_id();
 	event->ts = bpf_ktime_get_ns();
 	event->event.exec.old_pid = old_pid;
@@ -863,7 +909,7 @@ int BPF_PROG(on_cpuhp_enter, u32 cpu, int target, int state)
 	if (!(event = try_reserve_event()))
 		return -ENOMEM;
 
-	event->type = CPU_HP;
+	event->type = CPU_HP_ENTER;
 	event->cpu = bpf_get_smp_processor_id();
 	event->ts = bpf_ktime_get_ns();
 	event->event.chp.cpu = cpu;
@@ -874,6 +920,36 @@ int BPF_PROG(on_cpuhp_enter, u32 cpu, int target, int state)
 		event->event.chp.pid = BPF_CORE_READ(p, pid);
 	else
 		event->event.chp.pid = 0;
+
+	bpf_ringbuf_submit(event, 0);
+
+	return 0;
+}
+
+SEC("tp_btf/cpuhp_exit")
+int BPF_PROG(on_cpuhp_exit, u32 cpu, int state, int idx, int ret)
+{
+	struct bpf_event *event;
+	struct task_struct *p;
+
+	if (!enable_bpf_events || !should_sample())
+		return 0;
+
+	if (!(event = try_reserve_event()))
+		return -ENOMEM;
+
+	event->type = CPU_HP_EXIT;
+	event->cpu = bpf_get_smp_processor_id();
+	event->ts = bpf_ktime_get_ns();
+	event->event.cxp.cpu = cpu;
+	event->event.cxp.state = state;
+	event->event.cxp.state = idx;
+	event->event.cxp.state = ret;
+	p = (struct task_struct *)bpf_get_current_task();
+	if (p)
+		event->event.cxp.pid = BPF_CORE_READ(p, pid);
+	else
+		event->event.cxp.pid = 0;
 
 	bpf_ringbuf_submit(event, 0);
 
@@ -896,6 +972,27 @@ int BPF_PROG(on_hw_pressure_update, u32 cpu, u64 hw_pressure)
 	event->ts = bpf_ktime_get_ns();
 	event->event.hwp.hw_pressure = hw_pressure;
 	event->event.hwp.cpu = cpu;
+
+	bpf_ringbuf_submit(event, 0);
+
+	return 0;
+}
+
+SEC("tp_btf/pstate_sample")
+int BPF_PROG(on_pstate_sample, u32 core_busy, u32 scaled_busy, u32 from, u32 to, u64 mperf, u64 aperf, u64 tsc, u32 freq, u32 io_boost)
+{
+	struct bpf_event *event;
+
+	if (!enable_bpf_events || !should_sample())
+		return 0;
+
+	if (!(event = try_reserve_event()))
+		return -ENOMEM;
+
+	event->type = PSTATE_SAMPLE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->ts = bpf_ktime_get_ns();
+	event->event.pstate.busy = scaled_busy;
 
 	bpf_ringbuf_submit(event, 0);
 

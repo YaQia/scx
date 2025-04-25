@@ -1,0 +1,27 @@
+[package]
+name = "scx_chaos"
+version = "1.0.12"
+edition = "2021"
+authors = ["Jake Hillion <jake@hillion.co.uk>"]
+description = "scx_chaos A general purpose sched_ext scheduler designed to amplify race conditions"
+license = "GPL-2.0-only"
+
+[package.metadata.scx]
+ci.use_clippy = true
+
+[dependencies]
+scx_utils = { path = "../../../rust/scx_utils", version = "1.0.14" }
+scx_p2dq = { path = "../../../scheds/rust/scx_p2dq", version = "1.0.14" }
+
+anyhow = "1.0.65"
+clap = { version = "4.5.28", features = ["derive", "env", "unicode", "wrap_help"] }
+ctrlc = { version = "3.1", features = ["termination"] }
+libbpf-rs = "=0.25.0-beta.1"
+libc = "0.2.137"
+log = "0.4.17"
+nix = { version = "0.29", features = ["process"] }
+simplelog = "0.12"
+
+[build-dependencies]
+scx_utils = { path = "../../../rust/scx_utils", version = "1.0.14" }
+scx_p2dq = { path = "../../../scheds/rust/scx_p2dq", version = "1.0.14" }

@@ -4,29 +4,22 @@
 // GNU General Public License version 2.
 
 use scx_utils::compat;
-use scxtop::bpf_intf::*;
 use scxtop::bpf_skel::types::bpf_event;
 use scxtop::bpf_skel::*;
 use scxtop::cli::{generate_completions, Cli, Commands, TraceArgs, TuiArgs};
-use scxtop::config::get_config_path;
 use scxtop::config::Config;
 use scxtop::edm::{ActionHandler, BpfEventActionPublisher, BpfEventHandler, EventDispatchManager};
+use scxtop::mangoapp::poll_mangoapp;
 use scxtop::read_file_string;
 use scxtop::tracer::Tracer;
+use scxtop::Action;
 use scxtop::App;
 use scxtop::Event;
 use scxtop::Key;
 use scxtop::KeyMap;
-use scxtop::PerfEvent;
 use scxtop::PerfettoTraceManager;
 use scxtop::Tui;
-use scxtop::APP;
 use scxtop::SCHED_NAME_PATH;
-use scxtop::STATS_SOCKET_PATH;
-use scxtop::{
-    Action, IPIAction, SchedCpuPerfSetAction, SchedSwitchAction, SchedWakeupAction,
-    SchedWakingAction, SoftIRQAction,
-};
 
 use anyhow::anyhow;
 use anyhow::Result;
@@ -39,7 +32,6 @@ use libbpf_rs::RingBufferBuilder;
 use libbpf_rs::UprobeOpts;
 use log::debug;
 use log::info;
-use log::trace;
 use ratatui::crossterm::event::KeyCode::Char;
 use simplelog::{
     ColorChoice, Config as SimplelogConfig, LevelFilter, TermLogger, TerminalMode, WriteLogger,
@@ -47,13 +39,12 @@ use simplelog::{
 use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 
-use std::fs;
+use std::ffi::CString;
 use std::fs::File;
 use std::mem::MaybeUninit;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn get_action(_app: &App, keymap: &KeyMap, event: Event) -> Action {
@@ -81,10 +72,11 @@ fn attach_progs(skel: &mut BpfSkel) -> Result<Vec<Link>> {
         skel.progs.on_sched_switch.attach()?,
         skel.progs.on_sched_wakeup.attach()?,
         skel.progs.on_sched_wakeup_new.attach()?,
+        skel.progs.on_sched_waking.attach()?,
     ];
 
     // 6.13 compatibility
-    if compat::ksym_exists("scx_insert_vtime").is_ok() {
+    if compat::ksym_exists("scx_insert_vtime")? {
         if let Ok(link) = skel.progs.scx_insert_vtime.attach() {
             links.push(link);
         }
@@ -120,15 +112,11 @@ fn attach_progs(skel: &mut BpfSkel) -> Result<Vec<Link>> {
     if let Ok(link) = skel.progs.on_cpuhp_enter.attach() {
         links.push(link);
     }
-    if compat::ksym_exists("gpu_memory_total").is_ok() {
-        if let Ok(link) = skel.progs.on_gpu_memory_total.attach() {
-            links.push(link);
-        }
+    if let Ok(link) = skel.progs.on_cpuhp_exit.attach() {
+        links.push(link);
     }
-    if compat::ksym_exists("hw_pressure_update").is_ok() {
-        if let Ok(link) = skel.progs.on_hw_pressure_update.attach() {
-            links.push(link);
-        }
+    if let Ok(link) = skel.progs.on_pstate_sample.attach() {
+        links.push(link);
     }
 
     Ok(links)
@@ -169,10 +157,14 @@ fn run_trace(trace_args: &TraceArgs) -> Result<()> {
             let skel = builder.open(&mut open_object)?;
             // set sample rate to 1 here to populate the BPF tctxs
             skel.maps.data_data.sample_rate = 1;
+            compat::cond_kprobe_enable("gpu_memory_total", &skel.progs.on_gpu_memory_total)?;
+            compat::cond_kprobe_enable("hw_pressure_update", &skel.progs.on_hw_pressure_update)?;
 
             let mut skel = skel.load()?;
             let mut links = attach_progs(&mut skel)?;
             links.push(skel.progs.on_sched_fork.attach()?);
+            links.push(skel.progs.on_sched_exec.attach()?);
+            links.push(skel.progs.on_sched_exit.attach()?);
 
             let trace_dur = std::time::Duration::from_millis(trace_args.trace_ms);
             let bpf_publisher = BpfEventActionPublisher::new(action_tx.clone());
@@ -296,6 +288,8 @@ fn run_tui(tui_args: &TuiArgs) -> Result<()> {
             skel.maps.rodata_data.long_tail_tracing_min_latency_ns =
                 tui_args.experimental_long_tail_tracing_min_latency_ns;
 
+            compat::cond_kprobe_enable("gpu_memory_total", &skel.progs.on_gpu_memory_total)?;
+            compat::cond_kprobe_enable("hw_pressure_update", &skel.progs.on_hw_pressure_update)?;
             let mut skel = skel.load()?;
             let mut links = attach_progs(&mut skel)?;
             skel.progs.scxtop_init.test_run(ProgramInput::default())?;
@@ -369,6 +363,23 @@ fn run_tui(tui_args: &TuiArgs) -> Result<()> {
                     }
                 }
             });
+
+            if tui_args.mangoapp_tracing {
+                let stop_mangoapp = app.should_quit.clone();
+                let mangoapp_path = CString::new(tui_args.mangoapp_path.clone()).unwrap();
+                let poll_intvl_ms = tui_args.mangoapp_poll_intvl_ms;
+                let tx = action_tx.clone();
+                tokio::spawn(async move {
+                    poll_mangoapp(
+                        mangoapp_path,
+                        poll_intvl_ms,
+                        tx,
+                        stop_mangoapp,
+                    )
+                    .await
+                });
+            }
+
 
             loop {
                 tokio::select! {

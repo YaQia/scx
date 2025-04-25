@@ -60,6 +60,7 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use bitvec::prelude::*;
+use sscanf::sscanf;
 use std::fmt;
 use std::ops::BitAndAssign;
 use std::ops::BitOrAssign;
@@ -135,6 +136,15 @@ impl Cpumask {
         }
 
         Ok(Self { mask })
+    }
+
+    pub fn from_cpulist(cpulist: &str) -> Result<Cpumask> {
+        let mut mask = Cpumask::new();
+        for cpu_id in read_cpulist(cpulist)? {
+            let _ = mask.set_cpu(cpu_id);
+        }
+
+        Ok(mask)
     }
 
     pub fn from_vec(vec: Vec<u64>) -> Self {
@@ -297,10 +307,10 @@ impl Cpumask {
             .collect();
 
         // Throw out possible stray from u64 -> u32.
-        masks.truncate((*NR_CPU_IDS + 31) / 32);
+        masks.truncate((*NR_CPU_IDS).div_ceil(32));
 
         // Print the highest 32bit. Trim digits beyond *NR_CPU_IDS.
-        let width = match (*NR_CPU_IDS + 3) / 4 % 8 {
+        let width = match (*NR_CPU_IDS).div_ceil(4) % 8 {
             0 => 8,
             v => v,
         };
@@ -313,13 +323,34 @@ impl Cpumask {
         // The rest in descending order.
         for submask in masks.iter().rev() {
             match case {
-                'x' => write!(f, " {:08x}", submask)?,
-                'X' => write!(f, " {:08X}", submask)?,
+                'x' => write!(f, ",{:08x}", submask)?,
+                'X' => write!(f, ",{:08X}", submask)?,
                 _ => unreachable!(),
             }
         }
         Ok(())
     }
+}
+
+pub fn read_cpulist(cpulist: &str) -> Result<Vec<usize>> {
+    let cpu_groups: Vec<&str> = cpulist.split(',').collect();
+    let mut cpu_ids = vec![];
+    for group in cpu_groups.iter() {
+        let (min, max) = match sscanf!(group.trim(), "{usize}-{usize}") {
+            Ok((x, y)) => (x, y),
+            Err(_) => match sscanf!(group.trim(), "{usize}") {
+                Ok(x) => (x, x),
+                Err(_) => {
+                    bail!("Failed to parse cpulist {}", group.trim());
+                }
+            },
+        };
+        for i in min..(max + 1) {
+            cpu_ids.push(i);
+        }
+    }
+
+    Ok(cpu_ids)
 }
 
 pub struct CpumaskIterator<'a> {

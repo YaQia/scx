@@ -24,9 +24,6 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
-use libbpf_rs::skel::OpenSkel;
-use libbpf_rs::skel::Skel;
-use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
 use log::warn;
@@ -35,8 +32,7 @@ use scx_stats::prelude::*;
 use scx_utils::autopower::{fetch_power_profile, PowerProfile};
 use scx_utils::build_id;
 use scx_utils::compat;
-use scx_utils::import_enums;
-use scx_utils::scx_enums;
+use scx_utils::pm::{cpu_idle_resume_latency_supported, update_cpu_idle_resume_latency};
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
@@ -139,10 +135,18 @@ struct Opts {
     #[clap(short = 'l', long, allow_hyphen_values = true, default_value = "20000")]
     slice_us_lag: i64,
 
+    /// Set CPU idle QoS resume latency in microseconds (-1 = disabled).
+    ///
+    /// Setting a lower latency value makes CPUs less likely to enter deeper idle states, enhancing
+    /// performance at the cost of higher power consumption. Alternatively, increasing the latency
+    /// value may reduce performance, but also improve power efficiency.
+    #[clap(short = 'I', long, allow_hyphen_values = true, default_value = "-1")]
+    idle_resume_us: i64,
+
     /// Disable preemption.
     ///
-    /// Never allow tasks to preempt others before their assigned time slice expires. This can help
-    /// to increase system throughput over responsiveness.
+    /// Never allow tasks to be directly dispatched. This can help to increase fairness
+    /// over responsiveness.
     #[clap(short = 'n', long, action = clap::ArgAction::SetTrue)]
     no_preempt: bool,
 
@@ -166,6 +170,15 @@ struct Opts {
     #[clap(short = 'k', long, action = clap::ArgAction::SetTrue)]
     local_kthreads: bool,
 
+    /// Disable direct dispatch during synchronous wakeups.
+    ///
+    /// Enabling this option can lead to a more uniform load distribution across available cores,
+    /// potentially improving performance in certain scenarios. However, it may come at the cost of
+    /// reduced efficiency for pipe-intensive workloads that benefit from tighter producer-consumer
+    /// coupling.
+    #[clap(short = 'w', long, action = clap::ArgAction::SetTrue)]
+    no_wake_sync: bool,
+
     /// Specifies the initial set of CPUs, represented as a bitmask in hex (e.g., 0xff), that the
     /// scheduler will use to dispatch tasks, until the system becomes saturated, at which point
     /// tasks may overflow to other available CPUs.
@@ -186,6 +199,14 @@ struct Opts {
     /// Disable L3 cache awareness.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     disable_l3: bool,
+
+    /// Disable SMT awareness.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    disable_smt: bool,
+
+    /// Disable NUMA rebalancing.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    disable_numa: bool,
 
     /// Enable CPU frequency control (only with schedutil governor).
     ///
@@ -230,6 +251,7 @@ struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
     opts: &'a Opts,
+    topo: Topology,
     power_profile: PowerProfile,
     stats_server: StatsServer<(), Metrics>,
     user_restart: bool,
@@ -246,16 +268,28 @@ impl<'a> Scheduler<'a> {
         let topo = Topology::new().unwrap();
 
         // Check host topology to determine if we need to enable SMT capabilities.
+        let smt_enabled = !opts.disable_smt && topo.smt_enabled;
+
         info!(
             "{} {} {}",
             SCHEDULER_NAME,
             build_id::full_version(env!("CARGO_PKG_VERSION")),
-            if topo.smt_enabled {
-                "SMT on"
-            } else {
-                "SMT off"
-            }
+            if smt_enabled { "SMT on" } else { "SMT off" }
         );
+
+        if opts.idle_resume_us >= 0 {
+            if !cpu_idle_resume_latency_supported() {
+                warn!("idle resume latency not supported");
+            } else {
+                info!("Setting idle QoS to {} us", opts.idle_resume_us);
+                for cpu in topo.all_cpus.values() {
+                    update_cpu_idle_resume_latency(
+                        cpu.id,
+                        opts.idle_resume_us.try_into().unwrap(),
+                    )?;
+                }
+            }
+        }
 
         // Initialize BPF connector.
         let mut skel_builder = BpfSkelBuilder::default();
@@ -266,10 +300,12 @@ impl<'a> Scheduler<'a> {
 
         // Override default BPF scheduling parameters.
         skel.maps.rodata_data.debug = opts.debug;
-        skel.maps.rodata_data.smt_enabled = topo.smt_enabled;
+        skel.maps.rodata_data.smt_enabled = smt_enabled;
+        skel.maps.rodata_data.numa_disabled = opts.disable_numa;
         skel.maps.rodata_data.local_pcpu = opts.local_pcpu;
         skel.maps.rodata_data.local_kthreads = opts.local_kthreads;
         skel.maps.rodata_data.no_preempt = opts.no_preempt;
+        skel.maps.rodata_data.no_wake_sync = opts.no_wake_sync;
         skel.maps.rodata_data.slice_max = opts.slice_us * 1000;
         skel.maps.rodata_data.slice_min = opts.slice_us_min * 1000;
         skel.maps.rodata_data.slice_lag = opts.slice_us_lag * 1000;
@@ -281,7 +317,8 @@ impl<'a> Scheduler<'a> {
         skel.struct_ops.bpfland_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
-            | *compat::SCX_OPS_BUILTIN_IDLE_PER_NODE;
+            | *compat::SCX_OPS_BUILTIN_IDLE_PER_NODE
+            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
         info!(
             "scheduler flags: {:#x}",
             skel.struct_ops.bpfland_ops_mut().flags
@@ -303,7 +340,7 @@ impl<'a> Scheduler<'a> {
         }
 
         // Initialize SMT domains.
-        if topo.smt_enabled {
+        if smt_enabled {
             Self::init_smt_domains(&mut skel, &topo)?;
         }
 
@@ -324,6 +361,7 @@ impl<'a> Scheduler<'a> {
             skel,
             struct_ops,
             opts,
+            topo,
             power_profile,
             stats_server,
             user_restart: false,
@@ -523,8 +561,8 @@ impl<'a> Scheduler<'a> {
 
         // Update the BPF cpumasks for the cache domains.
         for (cache_id, cpus) in cache_id_map {
-            // Ignore the cache domain if it includes a single CPU or all the CPUs.
-            if cpus.len() <= 1 || cpus.len() == *NR_CPU_IDS {
+            // Ignore the cache domain if it includes a single CPU.
+            if cpus.len() <= 1 {
                 continue;
             }
 
@@ -609,6 +647,16 @@ impl<'a> Scheduler<'a> {
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         info!("Unregister {} scheduler", SCHEDULER_NAME);
+
+        // Restore default CPU idle QoS resume latency.
+        if self.opts.idle_resume_us >= 0 {
+            if cpu_idle_resume_latency_supported() {
+                for cpu in self.topo.all_cpus.values() {
+                    update_cpu_idle_resume_latency(cpu.id, cpu.pm_qos_resume_latency_us as i32)
+                        .unwrap();
+                }
+            }
+        }
     }
 }
 

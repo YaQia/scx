@@ -30,13 +30,16 @@ enum mode {
 };
 
 enum event_type {
-	CPU_HP,
+	CPU_HP_ENTER,
+	CPU_HP_EXIT,
 	CPU_PERF_SET,
 	EXEC,
+	EXIT,
 	FORK,
 	GPU_MEM,
 	HW_PRESSURE,
 	IPI,
+	PSTATE_SAMPLE,
 	SCHED_REG,
 	SCHED_SWITCH,
 	SCHED_UNREG,
@@ -72,6 +75,7 @@ struct sched_switch_event {
 
 struct wakeup_event {
 	u32		pid;
+	u32		tgid;
 	int		prio;
 	char		comm[MAX_COMM];
 };
@@ -85,6 +89,13 @@ struct softirq_event {
 	u64		exit_ts;
 	u32		pid;
 	int		softirq_nr;
+};
+
+struct exit_event {
+	u32		pid;
+	u32		prio;
+	u32		tgid;
+	char		comm[MAX_COMM];
 };
 
 struct fork_event {
@@ -110,11 +121,19 @@ struct gpu_mem_event {
 	u32             pid;
 };
 
-struct cpuhp_event {
+struct cpuhp_enter_event {
 	u32             cpu;
 	u32             pid;
 	int             target;
 	int             state;
+};
+
+struct cpuhp_exit_event {
+	u32             cpu;
+	u32             pid;
+	int             state;
+	int             idx;
+	int             ret;
 };
 
 struct hw_pressure_event {
@@ -127,17 +146,24 @@ struct trace_started_event {
 	bool		stop_scheduled;
 };
 
+struct pstate_sample_event {
+	u32             busy;
+};
+
 struct bpf_event {
 	int		type;
 	u64		ts;
 	u32		cpu;
 	union {
+		struct  exit_event exit;
 		struct  fork_event fork;
 		struct  exec_event exec;
 		struct  hw_pressure_event hwp;
 		struct  gpu_mem_event gm;
-		struct  cpuhp_event chp;
+		struct  cpuhp_enter_event chp;
+		struct  cpuhp_exit_event cxp;
 		struct	ipi_event ipi;
+		struct  pstate_sample_event pstate;
 		struct	sched_switch_event sched_switch;
 		struct	set_perf_event perf;
 		struct	softirq_event softirq;

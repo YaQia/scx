@@ -1,10 +1,10 @@
 #include <scx/common.bpf.h>
 #include <lib/sdt_task.h>
 
-#include "cpumask.h"
-#include "percpu.h"
+#include <lib/cpumask.h>
+#include <lib/percpu.h>
 
-static struct sdt_allocator scx_bitmap_allocator;
+static struct scx_allocator scx_bitmap_allocator;
 size_t mask_size;
 
 __weak
@@ -12,7 +12,7 @@ int scx_bitmap_init(__u64 total_mask_size)
 {
 	mask_size = div_round_up(total_mask_size, 8);
 
-	return sdt_alloc_init(&scx_bitmap_allocator, mask_size * 8 + sizeof(union sdt_id));
+	return scx_alloc_init(&scx_bitmap_allocator, mask_size * 8 + sizeof(union sdt_id));
 }
 
 __weak
@@ -22,9 +22,8 @@ u64 scx_bitmap_alloc_internal(void)
 	scx_bitmap_t mask;
 	int i;
 
-	data = sdt_alloc(&scx_bitmap_allocator);
-	cast_kern(data);
-	if (!data)
+	data = scx_alloc(&scx_bitmap_allocator);
+	if (unlikely(!data))
 		return (u64)(NULL);
 
 	mask = (scx_bitmap_t)data->payload;
@@ -44,9 +43,9 @@ u64 scx_bitmap_alloc_internal(void)
 __weak
 int scx_bitmap_free(scx_bitmap_t __arg_arena mask)
 {
-	sdt_subprog_init_arena();
+	scx_arena_subprog_init();
 
-	sdt_free_idx(&scx_bitmap_allocator, mask->tid.idx);
+	scx_alloc_free_idx(&scx_bitmap_allocator, mask->tid.idx);
 	return 0;
 }
 
@@ -55,7 +54,7 @@ int scx_bitmap_copy_to_stack(struct scx_bitmap *dst, scx_bitmap_t __arg_arena sr
 {
 	int i;
 
-	if (!src || !dst) {
+	if (unlikely(!src || !dst)) {
 		scx_bpf_error("invalid pointer args to pointer copy");
 		return 0;
 	}
@@ -143,26 +142,14 @@ scx_bitmap_to_bpf(struct bpf_cpumask __kptr *bpfmask __arg_trusted,
 		   scx_bitmap_t __arg_arena scx_bitmap)
 {
 	struct scx_bitmap *tmp;
-	int ret, i;
+	int ret;
 
-	if (bpf_ksym_exists(bpf_cpumask_from_bpf_mem)) {
-		tmp = scx_percpu_scx_bitmap_stack();
-		scx_bitmap_copy_to_stack(tmp, scx_bitmap);
+	tmp = scx_percpu_scx_bitmap_stack();
+	scx_bitmap_copy_to_stack(tmp, scx_bitmap);
 
-		ret = bpf_cpumask_from_bpf_mem(bpfmask, tmp, sizeof(*tmp));
-		if (ret)
-			scx_bpf_error("error");
-
-
-		return 0;
-	}
-
-	bpf_for(i, 0, nr_cpu_ids) {
-		if (scx_bitmap_test_cpu(i, scx_bitmap))
-			bpf_cpumask_set_cpu(i, bpfmask);
-		else
-			bpf_cpumask_clear_cpu(i, bpfmask);
-	}
+	ret = bpf_cpumask_populate((struct cpumask *)bpfmask, tmp->bits, sizeof(tmp->bits));
+	if (unlikely(ret))
+		scx_bpf_error("error %d when calling bpf_cpumask_populate", ret);
 
 	return 0;
 }

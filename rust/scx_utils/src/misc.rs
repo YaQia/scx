@@ -1,5 +1,5 @@
-use anyhow::bail;
 use anyhow::Result;
+use anyhow::{anyhow, bail};
 use libc;
 use log::{info, warn};
 use scx_stats::prelude::*;
@@ -79,7 +79,17 @@ pub fn set_rlimit_infinity() {
     };
 }
 
-pub fn read_file_usize(path: &Path) -> Result<usize> {
+/// Read a file and parse its content into the specified type.
+///
+/// Trims whitespace before parsing.
+///
+/// # Errors
+/// Returns an error if reading or parsing fails.
+pub fn read_from_file<T>(path: &Path) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
     let val = match std::fs::read_to_string(path) {
         Ok(val) => val,
         Err(_) => {
@@ -87,12 +97,46 @@ pub fn read_file_usize(path: &Path) -> Result<usize> {
         }
     };
 
-    match val.trim().parse::<usize>() {
+    match val.trim().parse::<T>() {
         Ok(parsed) => Ok(parsed),
         Err(_) => {
-            bail!("Failed to parse {}", val);
+            bail!("Failed to parse content '{}' from {:?}", val.trim(), path);
         }
     }
+}
+
+pub fn read_file_usize_vec(path: &Path, separator: char) -> Result<Vec<usize>> {
+    let val = std::fs::read_to_string(path)?;
+
+    val.split(separator)
+        .map(|s| {
+            s.trim()
+                .parse::<usize>()
+                .map_err(|_| anyhow!("Failed to parse '{}' as usize", s))
+        })
+        .collect::<Result<Vec<usize>>>()
+}
+
+pub fn read_file_byte(path: &Path) -> Result<usize> {
+    let val = std::fs::read_to_string(path)?;
+    let val = val.trim();
+
+    // E.g., 10K, 10M, 10G, 10
+    if val.ends_with("K") {
+        let byte = val[..val.len() - 1].parse::<usize>()?;
+        return Ok(byte * 1024);
+    }
+    if val.ends_with("M") {
+        let byte = val[..val.len() - 1].parse::<usize>()?;
+        return Ok(byte * 1024 * 1024);
+    }
+    if val.ends_with("G") {
+        let byte = val[..val.len() - 1].parse::<usize>()?;
+        return Ok(byte * 1024 * 1024 * 1024);
+    }
+
+    let byte = val.parse::<usize>()?;
+    Ok(byte)
 }
 
 /* Load is reported as weight * duty cycle

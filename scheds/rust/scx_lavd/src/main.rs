@@ -36,9 +36,6 @@ use crossbeam::channel::RecvTimeoutError;
 use crossbeam::channel::Sender;
 use crossbeam::channel::TrySendError;
 use itertools::iproduct;
-use libbpf_rs::skel::OpenSkel;
-use libbpf_rs::skel::Skel;
-use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
 use libc::c_char;
@@ -49,14 +46,15 @@ use scx_stats::prelude::*;
 use scx_utils::autopower::{fetch_power_profile, PowerProfile};
 use scx_utils::build_id;
 use scx_utils::compat;
-use scx_utils::import_enums;
-use scx_utils::scx_enums;
+use scx_utils::read_cpulist;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
 use scx_utils::set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
+use scx_utils::Cpumask;
+use scx_utils::EnergyModel;
 use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use scx_utils::NR_CPU_IDS;
@@ -101,6 +99,10 @@ struct Opts {
     /// Minimum scheduling slice duration in microseconds.
     #[clap(long = "slice-min-us", default_value = "300")]
     slice_min_us: u64,
+
+    /// List of CPUs in preferred order (e.g., "0-3,7,6,5,4").
+    #[clap(long = "cpu-pref-order", default_value = "")]
+    cpu_pref_order: String,
 
     /// Do not boost futex holders.
     #[clap(long = "no-futex-boost", action = clap::ArgAction::SetTrue)]
@@ -163,12 +165,13 @@ struct Opts {
 }
 
 impl Opts {
-    fn nothing_specified(&self) -> bool {
+    fn autopilot_allowed(&self) -> bool {
         self.autopilot == false
             && self.autopower == false
             && self.performance == false
             && self.powersave == false
             && self.balanced == false
+            && self.cpu_pref_order == ""
             && self.no_core_compaction == false
             && self.prefer_smt_core == false
             && self.prefer_little_core == false
@@ -179,7 +182,7 @@ impl Opts {
     }
 
     fn proc(&mut self) -> Option<&mut Self> {
-        if self.nothing_specified() {
+        if self.autopilot_allowed() {
             self.autopilot = true;
             info!("Autopilot mode is enabled by default.");
             return Some(self);
@@ -227,14 +230,13 @@ impl introspec {
 #[derive(Debug, Clone)]
 struct CpuFlatId {
     node_id: usize,
+    pd_id: usize,
     llc_pos: usize,
     core_pos: usize,
     cpu_pos: usize,
     cpu_id: usize,
-    core_id: usize,
-    l2_id: usize,
-    l3_id: usize,
-    sharing_lvl: usize,
+    smt_level: usize,
+    cache_size: usize,
     cpu_cap: usize,
 }
 
@@ -255,6 +257,7 @@ struct ComputeDomainValue {
 
 #[derive(Debug)]
 struct FlatTopology {
+    all_cpus_mask: Cpumask,
     cpu_fids_performance: Vec<CpuFlatId>,
     cpu_fids_powersave: Vec<CpuFlatId>,
     cpdom_map: BTreeMap<ComputeDomainKey, ComputeDomainValue>,
@@ -280,47 +283,53 @@ impl fmt::Display for FlatTopology {
 impl FlatTopology {
     /// Build a flat-structured topology
     pub fn new() -> Result<FlatTopology> {
-        let topo = Topology::new().expect("Failed to build host topology");
-        let (cpu_fids_performance, avg_cap) = Self::build_cpu_fids(&topo, false, false).unwrap();
-        let (cpu_fids_powersave, _) = Self::build_cpu_fids(&topo, true, true).unwrap();
+        let sys_topo = Topology::new().expect("Failed to build host topology");
+        let sys_em = EnergyModel::new();
+        debug!("{:#?}", sys_topo);
+        debug!("{:#?}", sys_em);
+
+        let (cpu_fids_performance, avg_cap) =
+            Self::build_cpu_fids(&sys_topo, &sys_em, false).unwrap();
+        let (cpu_fids_powersave, _) = Self::build_cpu_fids(&sys_topo, &sys_em, true).unwrap();
 
         // Note that building compute domain is not dependent to CPU orer
         // so it is okay to use any cpu_fids_*.
         let cpdom_map = Self::build_cpdom(&cpu_fids_performance, avg_cap).unwrap();
 
         Ok(FlatTopology {
+            all_cpus_mask: sys_topo.span,
             cpu_fids_performance,
             cpu_fids_powersave,
             cpdom_map,
-            smt_enabled: topo.smt_enabled,
+            smt_enabled: sys_topo.smt_enabled,
         })
     }
 
     /// Build a flat-structured list of CPUs in a preference order
     fn build_cpu_fids(
         topo: &Topology,
-        prefer_smt_core: bool,
-        prefer_little_core: bool,
+        em: &Result<EnergyModel>,
+        prefer_powersave: bool,
     ) -> Option<(Vec<CpuFlatId>, usize)> {
         let mut cpu_fids = Vec::new();
-        debug!("{:#?}", topo);
 
         // Build a vector of cpu flat ids.
         let mut avg_cap = 0;
         for (&node_id, node) in topo.nodes.iter() {
             for (llc_pos, (_llc_id, llc)) in node.llcs.iter().enumerate() {
-                for (core_pos, (core_id, core)) in llc.cores.iter().enumerate() {
+                for (core_pos, (_core_id, core)) in llc.cores.iter().enumerate() {
                     for (cpu_pos, (cpu_id, cpu)) in core.cpus.iter().enumerate() {
+                        let cpu_id = *cpu_id;
+                        let pd_id = Self::get_pd_id(em, cpu_id, node_id);
                         let cpu_fid = CpuFlatId {
                             node_id,
+                            pd_id,
                             llc_pos,
                             core_pos,
                             cpu_pos,
-                            cpu_id: *cpu_id,
-                            core_id: *core_id,
-                            l2_id: cpu.l2_id,
-                            l3_id: cpu.l3_id,
-                            sharing_lvl: 0,
+                            cpu_id,
+                            smt_level: cpu.smt_level,
+                            cache_size: cpu.cache_size,
                             cpu_cap: cpu.cpu_capacity,
                         };
                         cpu_fids.push(RefCell::new(cpu_fid));
@@ -331,28 +340,6 @@ impl FlatTopology {
         }
         avg_cap /= cpu_fids.len() as usize;
 
-        // Initialize cpu's hardware resource sharing level
-        for (a_id, cpu_fid_a) in cpu_fids.iter().enumerate() {
-            for (b_id, cpu_fid_b) in cpu_fids.iter().enumerate() {
-                if a_id == b_id {
-                    continue;
-                }
-
-                let mut a = cpu_fid_a.borrow_mut();
-                let b = cpu_fid_b.borrow();
-
-                if a.core_id == b.core_id {
-                    a.sharing_lvl += 1;
-                }
-                if a.l2_id == b.l2_id {
-                    a.sharing_lvl += 1;
-                }
-                if a.l3_id == b.l3_id {
-                    a.sharing_lvl += 1;
-                }
-            }
-        }
-
         // Convert a vector of RefCell to a vector of plain cpu_fids
         let mut cpu_fids2 = Vec::new();
         for cpu_fid in cpu_fids.iter() {
@@ -361,52 +348,32 @@ impl FlatTopology {
         let mut cpu_fids = cpu_fids2;
 
         // Sort the cpu_fids
-        match (prefer_smt_core, prefer_little_core) {
-            (true, false) => {
-                // Sort the cpu_fids by node, llc, ^cpu_cap, ^sharing_lvl, core, and cpu order
-                cpu_fids.sort_by(|a, b| {
-                    a.node_id
-                        .cmp(&b.node_id)
-                        .then_with(|| a.llc_pos.cmp(&b.llc_pos))
-                        .then_with(|| b.cpu_cap.cmp(&a.cpu_cap))
-                        .then_with(|| b.sharing_lvl.cmp(&a.sharing_lvl))
-                        .then_with(|| a.core_pos.cmp(&b.core_pos))
-                        .then_with(|| a.cpu_pos.cmp(&b.cpu_pos))
-                });
-            }
-            (true, true) => {
-                // Sort the cpu_fids by node, llc, cpu_cap, ^sharing_lvl, core, and cpu order
+        match prefer_powersave {
+            true => {
+                // Sort the cpu_fids by node, llc, cpu_cap, ^smt_level, ^cache_size, perf_dom, core, and cpu order
                 cpu_fids.sort_by(|a, b| {
                     a.node_id
                         .cmp(&b.node_id)
                         .then_with(|| a.llc_pos.cmp(&b.llc_pos))
                         .then_with(|| a.cpu_cap.cmp(&b.cpu_cap))
-                        .then_with(|| b.sharing_lvl.cmp(&a.sharing_lvl))
+                        .then_with(|| b.smt_level.cmp(&a.smt_level))
+                        .then_with(|| b.cache_size.cmp(&a.cache_size))
+                        .then_with(|| a.pd_id.cmp(&b.pd_id))
                         .then_with(|| a.core_pos.cmp(&b.core_pos))
                         .then_with(|| a.cpu_pos.cmp(&b.cpu_pos))
                 });
             }
-            (false, false) => {
-                // Sort the cpu_fids by cpu, node, llc, ^cpu_cap, sharing_lvl, and core order
+            false => {
+                // Sort the cpu_fids by cpu, node, llc, ^cpu_cap, smt_level, ^cache_size, perf_dom, and core order
                 cpu_fids.sort_by(|a, b| {
                     a.cpu_pos
                         .cmp(&b.cpu_pos)
                         .then_with(|| a.node_id.cmp(&b.node_id))
                         .then_with(|| a.llc_pos.cmp(&b.llc_pos))
                         .then_with(|| b.cpu_cap.cmp(&a.cpu_cap))
-                        .then_with(|| a.sharing_lvl.cmp(&b.sharing_lvl))
-                        .then_with(|| a.core_pos.cmp(&b.core_pos))
-                });
-            }
-            (false, true) => {
-                // Sort the cpu_fids by cpu, node, llc, cpu_cap, sharing_lvl, and core order
-                cpu_fids.sort_by(|a, b| {
-                    a.cpu_pos
-                        .cmp(&b.cpu_pos)
-                        .then_with(|| a.node_id.cmp(&b.node_id))
-                        .then_with(|| a.llc_pos.cmp(&b.llc_pos))
-                        .then_with(|| a.cpu_cap.cmp(&b.cpu_cap))
-                        .then_with(|| a.sharing_lvl.cmp(&b.sharing_lvl))
+                        .then_with(|| a.smt_level.cmp(&b.smt_level))
+                        .then_with(|| b.cache_size.cmp(&a.cache_size))
+                        .then_with(|| a.pd_id.cmp(&b.pd_id))
                         .then_with(|| a.core_pos.cmp(&b.core_pos))
                 });
             }
@@ -415,12 +382,22 @@ impl FlatTopology {
         Some((cpu_fids, avg_cap))
     }
 
+    /// Get the performance domain (i.e., CPU frequency domain) ID for a CPU.
+    /// If the energy model is not available, use NUMA node ID instead.
+    fn get_pd_id(em: &Result<EnergyModel>, cpu_id: usize, node_id: usize) -> usize {
+        match em {
+            Ok(em) => em.get_pd(cpu_id).unwrap().id,
+            Err(_) => node_id,
+        }
+    }
+
     /// Build a list of compute domains
     fn build_cpdom(
         cpu_fids: &Vec<CpuFlatId>,
         avg_cap: usize,
     ) -> Option<BTreeMap<ComputeDomainKey, ComputeDomainValue>> {
-        // Creat a compute domain map
+        // Creat a compute domain map, where a compute domain is a CPUs that
+        // are under the same node and LLC and have the same core type.
         let mut cpdom_id = 0;
         let mut cpdom_map: BTreeMap<ComputeDomainKey, ComputeDomainValue> = BTreeMap::new();
         for cpu_fid in cpu_fids.iter() {
@@ -448,7 +425,9 @@ impl FlatTopology {
             cpdom_map.insert(key, value);
         }
 
-        // Fill up cpdom_alt_id for each compute domain
+        // Fill up cpdom_alt_id for each compute domain, where the alternative
+        // compute domain is a compute domain that are under the same node
+        // and LLC but has a different core type.
         for (k, v) in cpdom_map.iter() {
             let mut key = k.clone();
             key.is_big = !k.is_big;
@@ -458,7 +437,8 @@ impl FlatTopology {
             }
         }
 
-        // Build a neighbor map for each compute domain
+        // Build a neighbor map for each compute domain, where neighbors are
+        // ordered by core type, node, and LLC.
         for ((from_k, from_v), (to_k, to_v)) in iproduct!(cpdom_map.iter(), cpdom_map.iter()) {
             if from_k == to_k {
                 continue;
@@ -553,7 +533,7 @@ impl<'a> Scheduler<'a> {
 
         // Initialize CPU topology
         let topo = FlatTopology::new().unwrap();
-        Self::init_cpus(&mut skel, &topo);
+        Self::init_cpus(&mut skel, &opts, &topo);
 
         // Initialize skel according to @opts.
         Self::init_globals(&mut skel, &opts, &topo);
@@ -586,17 +566,43 @@ impl<'a> Scheduler<'a> {
         })
     }
 
-    fn init_cpus(skel: &mut OpenBpfSkel, topo: &FlatTopology) {
-        // Initialize CPU order topologically sorted
-        // by a cpu, node, llc, max_freq, and core order
-        for (pos, cpu) in topo.cpu_fids_performance.iter().enumerate() {
-            skel.maps.rodata_data.cpu_order_performance[pos] = cpu.cpu_id as u16;
-            skel.maps.rodata_data.__cpu_capacity_hint[cpu.cpu_id] = cpu.cpu_cap as u16;
-        }
-        for (pos, cpu) in topo.cpu_fids_powersave.iter().enumerate() {
-            skel.maps.rodata_data.cpu_order_powersave[pos] = cpu.cpu_id as u16;
-        }
+    fn init_cpus(skel: &mut OpenBpfSkel, opts: &Opts, topo: &FlatTopology) {
         debug!("{:#?}", topo);
+
+        // Initialize CPU capacity
+        for (_, cpu) in topo.cpu_fids_performance.iter().enumerate() {
+            skel.maps.rodata_data.cpu_capacity[cpu.cpu_id] = cpu.cpu_cap as u16;
+        }
+
+        // If cpu_pref_order is not specified, initialize CPU order
+        // topologically sorted by a cpu, node, llc, max_freq, and core order.
+        // Otherwise, follow the specified CPU preference order.
+        let mut cpu_pf_order = vec![];
+        let mut cpu_ps_order = vec![];
+        if opts.cpu_pref_order == "" {
+            for cpu in topo.cpu_fids_performance.iter() {
+                cpu_pf_order.push(cpu.cpu_id);
+            }
+            for cpu in topo.cpu_fids_powersave.iter() {
+                cpu_ps_order.push(cpu.cpu_id);
+            }
+        } else {
+            let cpu_list = read_cpulist(&opts.cpu_pref_order).unwrap();
+            let pref_mask = Cpumask::from_cpulist(&opts.cpu_pref_order).unwrap();
+            if pref_mask != topo.all_cpus_mask {
+                panic!("--cpu_pref_order does not cover the whole CPUs.");
+            }
+            cpu_pf_order = cpu_list.clone();
+            cpu_ps_order = cpu_list.clone();
+        }
+        for (pos, cpu) in cpu_pf_order.iter().enumerate() {
+            skel.maps.rodata_data.cpu_order_performance[pos] = *cpu as u16;
+        }
+        for (pos, cpu) in cpu_ps_order.iter().enumerate() {
+            skel.maps.rodata_data.cpu_order_powersave[pos] = *cpu as u16;
+        }
+        info!("CPU pref order in performance mode: {:?}", cpu_pf_order);
+        info!("CPU pref order in powersave mode: {:?}", cpu_ps_order);
 
         // Initialize compute domain contexts
         for (k, v) in topo.cpdom_map.iter() {
@@ -643,6 +649,12 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.verbose = opts.verbose;
         skel.maps.rodata_data.slice_max_ns = opts.slice_max_us * 1000;
         skel.maps.rodata_data.slice_min_ns = opts.slice_min_us * 1000;
+
+        skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP
+            | *compat::SCX_OPS_ENQ_EXITING
+            | *compat::SCX_OPS_ENQ_LAST
+            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
+            | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
     }
 
     fn get_msg_seq_id() -> u64 {
@@ -685,13 +697,14 @@ impl<'a> Scheduler<'a> {
             static_prio: tx.static_prio,
             slice_boost_prio: tc.slice_boost_prio,
             run_freq: tc.run_freq,
-            run_time_ns: tc.run_time_ns,
+            avg_runtime: tc.avg_runtime,
             wait_freq: tc.wait_freq,
             wake_freq: tc.wake_freq,
             perf_cri: tc.perf_cri,
             thr_perf_cri: tx.thr_perf_cri,
             cpuperf_cur: tx.cpuperf_cur,
             cpu_util: tx.cpu_util,
+            cpu_sutil: tx.cpu_sutil,
             nr_active: tx.nr_active,
         }) {
             Ok(()) | Err(TrySendError::Full(_)) => 0,
@@ -735,7 +748,7 @@ impl<'a> Scheduler<'a> {
                 self.mseq_id += 1;
 
                 let bss_data = &self.skel.maps.bss_data;
-                let st = bss_data.__sys_stats[0];
+                let st = bss_data.sys_stat;
 
                 let mseq = self.mseq_id;
                 let nr_queued_task = st.nr_queued_task;

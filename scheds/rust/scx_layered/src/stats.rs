@@ -11,13 +11,13 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::bail;
 use anyhow::Result;
-use bitvec::prelude::*;
 use chrono::DateTime;
 use chrono::Local;
 use log::warn;
 use scx_stats::prelude::*;
 use scx_stats_derive::stat_doc;
 use scx_stats_derive::Stats;
+use scx_utils::Cpumask;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -69,6 +69,7 @@ const LSTAT_XLAYER_WAKE: usize = bpf_intf::layer_stat_id_LSTAT_XLAYER_WAKE as us
 const LSTAT_XLAYER_REWAKE: usize = bpf_intf::layer_stat_id_LSTAT_XLAYER_REWAKE as usize;
 const LSTAT_LLC_DRAIN_TRY: usize = bpf_intf::layer_stat_id_LSTAT_LLC_DRAIN_TRY as usize;
 const LSTAT_LLC_DRAIN: usize = bpf_intf::layer_stat_id_LSTAT_LLC_DRAIN as usize;
+const LSTAT_SKIP_REMOTE_NODE: usize = bpf_intf::layer_stat_id_LSTAT_SKIP_REMOTE_NODE as usize;
 
 const LLC_LSTAT_LAT: usize = bpf_intf::llc_layer_stat_id_LLC_LSTAT_LAT as usize;
 const LLC_LSTAT_CNT: usize = bpf_intf::llc_layer_stat_id_LLC_LSTAT_CNT as usize;
@@ -183,8 +184,10 @@ pub struct LayerStats {
     pub llc_drain_try: f64,
     #[stat(desc = "% LLC draining succeeded")]
     pub llc_drain: f64,
+    #[stat(desc = "% skip LLC dispatch on remote node")]
+    pub skip_remote_node: f64,
     #[stat(desc = "mask of allocated CPUs", _om_skip)]
-    pub cpus: Vec<u32>,
+    pub cpus: Vec<u64>,
     #[stat(desc = "count of CPUs assigned")]
     pub cur_nr_cpus: u32,
     #[stat(desc = "minimum # of CPUs assigned")]
@@ -202,22 +205,6 @@ pub struct LayerStats {
 }
 
 impl LayerStats {
-    fn bitvec_to_u32s(bitvec: &BitVec<u64, Lsb0>) -> Vec<u32> {
-        let mut vals = Vec::<u32>::new();
-        let mut val: u32 = 0;
-        for (idx, bit) in bitvec.iter().enumerate() {
-            if idx > 0 && idx % 32 == 0 {
-                vals.push(val);
-                val = 0;
-            }
-            if *bit {
-                val |= 1 << (idx % 32);
-            }
-        }
-        vals.push(val);
-        vals
-    }
-
     pub fn new(
         lidx: usize,
         layer: &Layer,
@@ -230,7 +217,8 @@ impl LayerStats {
             + lstat(LSTAT_ENQ_LOCAL)
             + lstat(LSTAT_ENQ_WAKEUP)
             + lstat(LSTAT_ENQ_EXPIRE)
-            + lstat(LSTAT_ENQ_REENQ);
+            + lstat(LSTAT_ENQ_REENQ)
+            + lstat(LSTAT_KEEP);
         let lstat_pct = |sidx| {
             if ltotal != 0 {
                 lstat(sidx) as f64 / ltotal as f64 * 100.0
@@ -290,7 +278,8 @@ impl LayerStats {
             xllc_migration_skip: lstat_pct(LSTAT_XLLC_MIGRATION_SKIP),
             llc_drain_try: lstat_pct(LSTAT_LLC_DRAIN_TRY),
             llc_drain: lstat_pct(LSTAT_LLC_DRAIN),
-            cpus: Self::bitvec_to_u32s(layer.cpus.as_raw_bitvec()),
+            skip_remote_node: lstat_pct(LSTAT_SKIP_REMOTE_NODE),
+            cpus: layer.cpus.as_raw_slice().to_vec(),
             cur_nr_cpus: layer.cpus.weight() as u32,
             min_nr_cpus: nr_cpus_range.0 as u32,
             max_nr_cpus: nr_cpus_range.1 as u32,
@@ -381,12 +370,13 @@ impl LayerStats {
 
         writeln!(
             w,
-            "  {:<width$}  xlayer_wake/re={}/{} llc_drain/try={}/{}",
+            "  {:<width$}  xlayer_wake/re={}/{} llc_drain/try={}/{} skip_rnode={}",
             "",
             fmt_pct(self.xlayer_wake),
             fmt_pct(self.xlayer_rewake),
             fmt_pct(self.llc_drain),
             fmt_pct(self.llc_drain_try),
+            fmt_pct(self.skip_remote_node),
             width = header_width,
         )?;
 
@@ -400,11 +390,7 @@ impl LayerStats {
             width = header_width
         )?;
 
-        let mut cpus = self
-            .cpus
-            .iter()
-            .fold(String::new(), |string, v| format!("{}{:08x} ", string, v));
-        cpus.pop();
+        let cpumask = Cpumask::from_vec(self.cpus.clone());
 
         writeln!(
             w,
@@ -413,7 +399,7 @@ impl LayerStats {
             self.cur_nr_cpus,
             self.min_nr_cpus,
             self.max_nr_cpus,
-            &cpus,
+            &cpumask,
             width = header_width
         )?;
 
@@ -522,7 +508,8 @@ impl SysStats {
             + lsum(LSTAT_ENQ_LOCAL)
             + lsum(LSTAT_ENQ_WAKEUP)
             + lsum(LSTAT_ENQ_EXPIRE)
-            + lsum(LSTAT_ENQ_REENQ);
+            + lsum(LSTAT_ENQ_REENQ)
+            + lsum(LSTAT_KEEP);
         let lsum_pct = |idx| {
             if total != 0 {
                 lsum(idx) as f64 / total as f64 * 100.0

@@ -146,7 +146,7 @@ pub struct SchedSample {
     #[stat(desc = "How often this task is scheduled per second")]
     pub run_freq: u64,
     #[stat(desc = "Average runtime per schedule")]
-    pub run_time_ns: u64,
+    pub avg_runtime: u64,
     #[stat(desc = "How frequently this task waits for other tasks")]
     pub wait_freq: u64,
     #[stat(desc = "How frequently this task wakes other tasks")]
@@ -157,8 +157,10 @@ pub struct SchedSample {
     pub thr_perf_cri: u32,
     #[stat(desc = "Target performance level of this CPU")]
     pub cpuperf_cur: u32,
-    #[stat(desc = "CPU utilization of this particular CPU")]
+    #[stat(desc = "CPU utilization of this CPU")]
     pub cpu_util: u64,
+    #[stat(desc = "Scaled CPU utilization of this CPU")]
+    pub cpu_sutil: u64,
     #[stat(desc = "Number of active CPUs when core compaction is enabled")]
     pub nr_active: u32,
 }
@@ -167,7 +169,7 @@ impl SchedSample {
     pub fn format_header<W: Write>(w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "\x1b[93m| {:6} | {:7} | {:17} | {:5} | {:4} | {:8} | {:8} | {:7} | {:8} | {:7} | {:9} | {:9} | {:9} | {:9} | {:8} | {:8} | {:8} | {:8} | {:6} |\x1b[0m",
+            "\x1b[93m| {:6} | {:7} | {:17} | {:5} | {:4} | {:8} | {:8} | {:7} | {:8} | {:7} | {:9} | {:9} | {:9} | {:9} | {:8} | {:8} | {:8} | {:8} | {:8} | {:6} |\x1b[0m",
             "MSEQ",
             "PID",
             "COMM",
@@ -186,6 +188,7 @@ impl SchedSample {
             "THR_PC",
             "CPUFREQ",
             "CPU_UTIL",
+            "CPU_SUTIL",
             "NR_ACT",
         )?;
         Ok(())
@@ -198,7 +201,7 @@ impl SchedSample {
 
         writeln!(
             w,
-            "| {:6} | {:7} | {:17} | {:5} | {:4} | {:8} | {:8} | {:7} | {:8} | {:7} | {:9} | {:9} | {:9} | {:9} | {:8} | {:8} | {:8} | {:8} | {:6} |",
+            "| {:6} | {:7} | {:17} | {:5} | {:4} | {:8} | {:8} | {:7} | {:8} | {:7} | {:9} | {:9} | {:9} | {:9} | {:8} | {:8} | {:8} | {:8} | {:8} | {:6} |",
             self.mseq,
             self.pid,
             self.comm,
@@ -210,13 +213,14 @@ impl SchedSample {
             self.static_prio,
             self.slice_boost_prio,
             self.run_freq,
-            self.run_time_ns,
+            self.avg_runtime,
             self.wait_freq,
             self.wake_freq,
             self.perf_cri,
             self.thr_perf_cri,
             self.cpuperf_cur,
             self.cpu_util,
+            self.cpu_sutil,
             self.nr_active,
         )?;
         Ok(())

@@ -27,6 +27,7 @@
 #include "user_exit_info.h"
 #include "enum_defs.autogen.h"
 
+#define PF_IO_WORKER			0x00000010	/* Task is an IO worker */
 #define PF_WQ_WORKER			0x00000020	/* I'm a workqueue worker */
 #define PF_KTHREAD			0x00200000	/* I am a kernel thread */
 #define PF_EXITING			0x00000004
@@ -105,6 +106,9 @@ void scx_bpf_events(struct scx_event_stats *events, size_t events__sz) __ksym __
 static inline __attribute__((format(printf, 1, 2)))
 void ___scx_bpf_bstr_format_checker(const char *fmt, ...) {}
 
+#define SCX_STRINGIFY(x) #x
+#define SCX_TOSTRING(x) SCX_STRINGIFY(x)
+
 /*
  * Helper macro for initializing the fmt and variadic argument inputs to both
  * bstr exit kfuncs. Callers to this function should use ___fmt and ___param to
@@ -139,13 +143,15 @@ void ___scx_bpf_bstr_format_checker(const char *fmt, ...) {}
  * scx_bpf_error() wraps the scx_bpf_error_bstr() kfunc with variadic arguments
  * instead of an array of u64. Invoking this macro will cause the scheduler to
  * exit in an erroneous state, with diagnostic information being passed to the
- * user.
+ * user. It appends the file and line number to aid debugging.
  */
 #define scx_bpf_error(fmt, args...)						\
 ({										\
-	scx_bpf_bstr_preamble(fmt, args)					\
+	scx_bpf_bstr_preamble(							\
+		__FILE__ ":" SCX_TOSTRING(__LINE__) ": " fmt, ##args)		\
 	scx_bpf_error_bstr(___fmt, ___param, sizeof(___param));			\
-	___scx_bpf_bstr_format_checker(fmt, ##args);				\
+	___scx_bpf_bstr_format_checker(						\
+		__FILE__ ":" SCX_TOSTRING(__LINE__) ": " fmt, ##args);		\
 })
 
 /*
@@ -288,8 +294,16 @@ void bpf_obj_drop_impl(void *kptr, void *meta) __ksym;
 #define bpf_obj_new(type) ((type *)bpf_obj_new_impl(bpf_core_type_id_local(type), NULL))
 #define bpf_obj_drop(kptr) bpf_obj_drop_impl(kptr, NULL)
 
-void bpf_list_push_front(struct bpf_list_head *head, struct bpf_list_node *node) __ksym;
-void bpf_list_push_back(struct bpf_list_head *head, struct bpf_list_node *node) __ksym;
+int bpf_list_push_front_impl(struct bpf_list_head *head,
+				    struct bpf_list_node *node,
+				    void *meta, __u64 off) __ksym;
+#define bpf_list_push_front(head, node) bpf_list_push_front_impl(head, node, NULL, 0)
+
+int bpf_list_push_back_impl(struct bpf_list_head *head,
+				   struct bpf_list_node *node,
+				   void *meta, __u64 off) __ksym;
+#define bpf_list_push_back(head, node) bpf_list_push_back_impl(head, node, NULL, 0)
+
 struct bpf_list_node *bpf_list_pop_front(struct bpf_list_head *head) __ksym;
 struct bpf_list_node *bpf_list_pop_back(struct bpf_list_head *head) __ksym;
 struct bpf_rb_node *bpf_rbtree_remove(struct bpf_rb_root *root,
@@ -428,8 +442,27 @@ static __always_inline const struct cpumask *cast_mask(struct bpf_cpumask *mask)
  */
 static inline bool is_migration_disabled(const struct task_struct *p)
 {
-	if (bpf_core_field_exists(p->migration_disabled))
-		return p->migration_disabled;
+	/*
+	 * Testing p->migration_disabled in a BPF code is tricky because the
+	 * migration is _always_ disabled while running the BPF code.
+	 * The prolog (__bpf_prog_enter) and epilog (__bpf_prog_exit) for BPF
+	 * code execution disable and re-enable the migration of the current
+	 * task, respectively. So, the _current_ task of the sched_ext ops is
+	 * always migration-disabled. Moreover, p->migration_disabled could be
+	 * two or greater when a sched_ext ops BPF code (e.g., ops.tick) is
+	 * executed in the middle of the other BPF code execution.
+	 *
+	 * Therefore, we should decide that the _current_ task is
+	 * migration-disabled only when its migration_disabled count is greater
+	 * than one. In other words, when  p->migration_disabled == 1, there is
+	 * an ambiguity, so we should check if @p is the current task or not.
+	 */
+	if (bpf_core_field_exists(p->migration_disabled)) {
+		if (p->migration_disabled == 1)
+			return bpf_get_current_task_btf() != p;
+		else
+			return p->migration_disabled;
+	}
 	return false;
 }
 
@@ -586,7 +619,6 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
  * is not type-compatible with 'signed char', and we define a separate case.
  *
  * This is copied verbatim from kernel's include/linux/compiler_types.h, but
- *
  * with default expression (for pointers) changed from (x) to (typeof(x)0).
  *
  * This is because LLVM has a bug where for lvalue (x), it does not get rid of

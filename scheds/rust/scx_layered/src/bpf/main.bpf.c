@@ -339,16 +339,11 @@ static void layer_llc_drain_disable(struct layer *layer, u32 llc_id)
 static inline bool refresh_layer_cpuc(struct cpu_ctx *cpuc, struct layer *layer)
 {
 	/* a CPU can be shared by multiple open layers */
-	if (layer->kind == LAYER_KIND_OPEN) {
-		cpuc->in_open_layers = true;
-		cpuc->layer_id = MAX_LAYERS;
-	} else {
-		cpuc->in_open_layers = false;
-		cpuc->layer_id = layer->id;
-	}
+	cpuc->in_open_layers = (layer->kind == LAYER_KIND_OPEN);
+	cpuc->layer_id = (layer->kind == LAYER_KIND_OPEN) ? MAX_LAYERS : layer->id;
 
 	if (cpuc->is_protected == layer->is_protected)
-		false;
+		return false;
 
 	cpuc->is_protected = layer->is_protected;
 	if (unlikely(!unprotected_cpumask)) {
@@ -404,8 +399,7 @@ static void refresh_cpumasks(u32 layer_id)
 
 		if ((u8_ptr = MEMBER_VPTR(layers, [layer_id].cpus[cpu / 8]))) {
 			if (*u8_ptr & (1 << (cpu % 8))) {
-				if (refresh_layer_cpuc(cpuc, layer))
-					protected_changed = true;
+				protected_changed = refresh_layer_cpuc(cpuc, layer) || protected_changed;
 
 				bpf_cpumask_set_cpu(cpu, layer_cpumask);
 			} else {
@@ -751,7 +745,7 @@ static void maybe_refresh_layered_cpus_unprotected(struct task_struct *p, struct
 }
 
 static s32 pick_idle_cpu_from(const struct cpumask *cand_cpumask, s32 prev_cpu,
-			      const struct cpumask *idle_smtmask)
+			      const struct cpumask *idle_smtmask, const struct layer *layer)
 {
 	bool prev_in_cand;
 	s32 cpu;
@@ -766,19 +760,34 @@ static s32 pick_idle_cpu_from(const struct cpumask *cand_cpumask, s32 prev_cpu,
 	 * partially idle @prev_cpu.
 	 */
 	if (smt_enabled) {
-		if (prev_in_cand &&
-		    bpf_cpumask_test_cpu(prev_cpu, idle_smtmask) &&
-		    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
-			return prev_cpu;
 
+		// try prev if prev_over_idle_core
+		if (prev_in_cand &&
+			layer->prev_over_idle_core) {
+			if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+				return prev_cpu;
+			prev_in_cand = false;
+		}
+
+		// try prev if smt sibling empty
+		if (prev_in_cand && bpf_cpumask_test_cpu(prev_cpu, idle_smtmask)) {
+			if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+				return prev_cpu;
+			prev_in_cand = false;
+		}
+
+		// try any idle core
 		cpu = scx_bpf_pick_idle_cpu(cand_cpumask, SCX_PICK_IDLE_CORE);
 		if (cpu >= 0)
 			return cpu;
 	}
 
-	if (prev_in_cand && scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+	// try prev if not previously tried and failed
+	if (prev_in_cand &&
+		scx_bpf_test_and_clear_cpu_idle(prev_cpu))
 		return prev_cpu;
 
+	// return any idle cpu
 	return scx_bpf_pick_idle_cpu(cand_cpumask, 0);
 }
 
@@ -830,7 +839,7 @@ s32 pick_idle_big_little(struct layer *layer, struct task_ctx *taskc,
 		bpf_cpumask_and(tmp_cpumask, cast_mask(taskc->layered_mask),
 				cast_mask(big_cpumask));
 		cpu = pick_idle_cpu_from(cast_mask(tmp_cpumask),
-					 prev_cpu, idle_smtmask);
+					 prev_cpu, idle_smtmask, layer);
 		goto out_put;
 	}
 	case GROWTH_ALGO_LITTLE_BIG: {
@@ -844,7 +853,7 @@ s32 pick_idle_big_little(struct layer *layer, struct task_ctx *taskc,
 		bpf_cpumask_and(tmp_cpumask, cast_mask(taskc->layered_mask),
 				cast_mask(tmp_cpumask));
 		cpu = pick_idle_cpu_from(cast_mask(tmp_cpumask),
-					 prev_cpu, idle_smtmask);
+					 prev_cpu, idle_smtmask, layer);
 		goto out_put;
 	}
 	default:
@@ -963,7 +972,7 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 			cpu = -1;
 			goto out_put;
 		}
-		if ((cpu = pick_idle_cpu_from(cpumask, prev_cpu, idle_smtmask)) >= 0)
+		if ((cpu = pick_idle_cpu_from(cpumask, prev_cpu, idle_smtmask, layer)) >= 0)
 			goto out_put;
 
 		if (!(prev_llcc = lookup_llc_ctx(prev_cpuc->llc_id)) ||
@@ -984,11 +993,11 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 			cpu = -1;
 			goto out_put;
 		}
-		if ((cpu = pick_idle_cpu_from(cpumask, prev_cpu, idle_smtmask)) >= 0)
+		if ((cpu = pick_idle_cpu_from(cpumask, prev_cpu, idle_smtmask, layer)) >= 0)
 			goto out_put;
 	}
 
-	if ((cpu = pick_idle_cpu_from(layered_cpumask, prev_cpu, idle_smtmask)) >= 0)
+	if ((cpu = pick_idle_cpu_from(layered_cpumask, prev_cpu, idle_smtmask, layer)) >= 0)
 		goto out_put;
 
 	/*
@@ -1000,7 +1009,7 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 	    if (!unprot_mask)
 		    unprot_mask = unprotected_cpumask;
 
-	    if ((cpu = pick_idle_cpu_from(cast_mask(unprot_mask), prev_cpu, idle_smtmask)) >= 0) {
+	    if ((cpu = pick_idle_cpu_from(cast_mask(unprot_mask), prev_cpu, idle_smtmask, layer)) >= 0) {
 		lstat_inc(LSTAT_OPEN_IDLE, layer, cpuc);
 		goto out_put;
 	    }
@@ -1174,7 +1183,7 @@ static void layer_kick_idle_cpu(struct layer *layer)
 	    !(idle_smtmask = scx_bpf_get_idle_smtmask()))
 		return;
 
-	if ((cpu = pick_idle_cpu_from(layer_cpumask, 0, idle_smtmask)) >= 0)
+	if ((cpu = pick_idle_cpu_from(layer_cpumask, 0, idle_smtmask, layer)) >= 0)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
 	scx_bpf_put_idle_cpumask(idle_smtmask);
@@ -1384,6 +1393,48 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 		layer_llc_drain_enable(layer, llc_id);
 		layer_kick_idle_cpu(layer);
 	}
+}
+
+static void account_used(struct cpu_ctx *cpuc, struct task_ctx *taskc, u64 now)
+{
+	s32 task_lid;
+	u64 used;
+
+	used = now - cpuc->used_at;
+	if (!used)
+		return;
+
+	task_lid = taskc->layer_id;
+	if (unlikely(task_lid >= nr_layers)) {
+		scx_bpf_error("invalid layer %d", task_lid);
+		return;
+	}
+
+	cpuc->used_at = now;
+	cpuc->usage += used;
+
+	/*
+	 * protect_owned/preempt accounting is a bit wrong in that they charge
+	 * the execution duration to the layer that just ran which may be
+	 * different from the layer that is protected on the CPU. Oh well...
+	 */
+	if (cpuc->running_owned) {
+		cpuc->layer_usages[task_lid][LAYER_USAGE_OWNED] += used;
+		if (cpuc->protect_owned)
+			cpuc->layer_usages[task_lid][LAYER_USAGE_PROTECTED] += used;
+		if (cpuc->protect_owned_preempt)
+			cpuc->layer_usages[task_lid][LAYER_USAGE_PROTECTED_PREEMPT] += used;
+	} else {
+		cpuc->layer_usages[task_lid][LAYER_USAGE_OPEN] += used;
+	}
+
+	if (taskc->dsq_id & HI_FB_DSQ_BASE)
+		gstat_add(GSTAT_HI_FB_USAGE, cpuc, used);
+	else if (taskc->dsq_id & LO_FB_DSQ_BASE)
+		gstat_add(GSTAT_LO_FB_USAGE, cpuc, used);
+
+	if (cpuc->running_fallback)
+		gstat_add(GSTAT_FB_CPU_USAGE, cpuc, used);
 }
 
 static bool keep_running(struct cpu_ctx *cpuc, struct task_struct *p)
@@ -1637,11 +1688,15 @@ static __always_inline bool try_consume_layer(u32 layer_id, struct cpu_ctx *cpuc
 {
 	struct llc_prox_map *llc_pmap = &llcc->prox_map;
 	struct layer *layer;
+	u32 nid = llc_node_id(llcc->id);
 	bool xllc_mig_skipped = false;
+	bool skip_remote_node;
 	u32 u;
 
 	if (!(layer = lookup_layer(layer_id)))
 		return false;
+
+	skip_remote_node = layer->skip_remote_node;
 
 	bpf_for(u, 0, llc_pmap->sys_end) {
 		u16 *llc_idp;
@@ -1656,6 +1711,11 @@ static __always_inline bool try_consume_layer(u32 layer_id, struct cpu_ctx *cpuc
 
 			if (!(remote_llcc = lookup_llc_ctx(*llc_idp)))
 				return false;
+
+			if (skip_remote_node && nid != llc_node_id(remote_llcc->id)) {
+				lstat_inc(LSTAT_SKIP_REMOTE_NODE, layer, cpuc);
+				continue;
+			}
 
 			if (remote_llcc->queued_runtime[layer_id] < layer->xllc_mig_min_ns) {
 				xllc_mig_skipped = true;
@@ -1762,7 +1822,7 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 	 * Low fallback DSQ execution is forced upto lo_fb_share_ppk fraction
 	 * after the DSQ had tasks queued for longer than lo_fb_wait_ns.
 	 */
-	if (!cpuc->is_protected && scx_bpf_dsq_nr_queued(cpuc->lo_fb_dsq_id)) {
+	if (scx_bpf_dsq_nr_queued(cpuc->lo_fb_dsq_id)) {
 		u64 now = scx_bpf_now();
 		u64 dur, usage;
 
@@ -1870,6 +1930,17 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 
 	if (!tried_lo_fb && scx_bpf_dsq_move_to_local(cpuc->lo_fb_dsq_id))
 		return;
+}
+
+void BPF_STRUCT_OPS(layered_tick, struct task_struct *p)
+{
+	struct cpu_ctx *cpuc;
+	struct task_ctx *taskc;
+
+	if (!(cpuc = lookup_cpu_ctx(-1)) || !(taskc = lookup_task_ctx(p)))
+		return;
+
+	account_used(cpuc, taskc, scx_bpf_now());
 }
 
 static __noinline bool match_one(struct layer_match *match,
@@ -2340,7 +2411,7 @@ void BPF_STRUCT_OPS(layered_running, struct task_struct *p)
 	cpuc->current_preempt = layer->preempt || is_preempt_kthread(p);
 	cpuc->current_exclusive = layer->exclusive;
 	cpuc->task_layer_id = taskc->layer_id;
-	cpuc->running_at = now;
+	cpuc->used_at = now;
 	taskc->running_at = now;
 	cpuc->is_protected = layer->is_protected;
 
@@ -2389,7 +2460,7 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	u64 now = scx_bpf_now();
 	u64 usage_since_idle;
 	s32 task_lid;
-	u64 used;
+	u64 runtime;
 
 	if (!(cpuc = lookup_cpu_ctx(-1)) || !(taskc = lookup_task_ctx(p)))
 		return;
@@ -2398,40 +2469,17 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	if (!(task_layer = lookup_layer(task_lid)))
 		return;
 
-	used = now - taskc->running_at;
-	cpuc->usage += used;
-
+	runtime = now - taskc->running_at;
 	taskc->runtime_avg =
-		((RUNTIME_DECAY_FACTOR - 1) * taskc->runtime_avg + used) /
+		((RUNTIME_DECAY_FACTOR - 1) * taskc->runtime_avg + runtime) /
 		RUNTIME_DECAY_FACTOR;
 
-	/*
-	 * protect_owned/preempt accounting is a bit wrong in that they charge
-	 * the execution duration to the layer that just ran which may be
-	 * different from the layer that is protected on the CPU. Oh well...
-	 */
-	if (cpuc->running_owned) {
-		cpuc->layer_usages[task_lid][LAYER_USAGE_OWNED] += used;
-		if (cpuc->protect_owned)
-			cpuc->layer_usages[task_lid][LAYER_USAGE_PROTECTED] += used;
-		if (cpuc->protect_owned_preempt)
-			cpuc->layer_usages[task_lid][LAYER_USAGE_PROTECTED_PREEMPT] += used;
-	} else {
-		cpuc->layer_usages[task_lid][LAYER_USAGE_OPEN] += used;
-	}
+	account_used(cpuc, taskc, now);
 
-	if (taskc->dsq_id & HI_FB_DSQ_BASE) {
+	if (taskc->dsq_id & HI_FB_DSQ_BASE)
 		gstat_inc(GSTAT_HI_FB_EVENTS, cpuc);
-		gstat_add(GSTAT_HI_FB_USAGE, cpuc, used);
-	} else if (taskc->dsq_id & LO_FB_DSQ_BASE) {
+	else if (taskc->dsq_id & LO_FB_DSQ_BASE)
 		gstat_inc(GSTAT_LO_FB_EVENTS, cpuc);
-		gstat_add(GSTAT_LO_FB_USAGE, cpuc, used);
-	}
-
-	if (cpuc->running_fallback) {
-		gstat_add(GSTAT_FB_CPU_USAGE, cpuc, used);
-		cpuc->running_fallback = false;
-	}
 
 	/*
 	 * Owned execution protection. Apply iff the CPU stayed saturated for
@@ -2461,6 +2509,7 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 		}
 	}
 
+	cpuc->running_fallback = false;
 	cpuc->current_preempt = false;
 	cpuc->prev_exclusive = cpuc->current_exclusive;
 	cpuc->current_exclusive = false;
@@ -2470,15 +2519,15 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	 * Apply min_exec_us, scale the execution time by the inverse of the
 	 * weight and charge.
 	 */
-	if (used < task_layer->min_exec_ns) {
+	if (runtime < task_layer->min_exec_ns) {
 		lstat_inc(LSTAT_MIN_EXEC, task_layer, cpuc);
-		lstat_add(LSTAT_MIN_EXEC_NS, task_layer, cpuc, task_layer->min_exec_ns - used);
-		used = task_layer->min_exec_ns;
+		lstat_add(LSTAT_MIN_EXEC_NS, task_layer, cpuc, task_layer->min_exec_ns - runtime);
+		runtime = task_layer->min_exec_ns;
 	}
 
-	if (cpuc->yielding && used < task_layer->slice_ns)
-		used = task_layer->slice_ns;
-	p->scx.dsq_vtime += used * 100 / p->scx.weight;
+	if (cpuc->yielding && runtime < task_layer->slice_ns)
+		runtime = task_layer->slice_ns;
+	p->scx.dsq_vtime += runtime * 100 / p->scx.weight;
 	cpuc->maybe_idle = true;
 }
 
@@ -2743,40 +2792,52 @@ void BPF_STRUCT_OPS(layered_disable, struct task_struct *p)
 	task_uncharge_qrt(taskc);
 }
 
-static u64 dsq_first_runnable_for_ms(u64 dsq_id, u64 now)
+static s64 dsq_first_runnable_at_ms(u64 dsq_id, u64 now)
 {
 	struct task_struct *p;
 
 	bpf_for_each(scx_dsq, p, dsq_id, 0) {
 		struct task_ctx *taskc;
 
-		if ((taskc = lookup_task_ctx(p)))
-			return (now - taskc->runnable_at) / 1000000;
+		if ((taskc = lookup_task_ctx(p))) {
+			u64 runnable_at = taskc->runnable_at;
+
+			if (runnable_at >= now)
+				return ((taskc->runnable_at - now) / 1000000);
+			else
+				return -((now - taskc->runnable_at) / 1000000);
+		}
 	}
 
 	return 0;
 }
 
+__hidden void dump_cpumask_word(s32 word, struct cpumask *cpumask)
+{
+	u32 u, v = 0;
+
+	bpf_for(u, 0, 32) {
+		s32 cpu = 32 * word + u;
+		if (cpu < nr_cpu_ids &&
+		    bpf_cpumask_test_cpu(cpu, cpumask))
+			v |= 1 << u;
+	}
+	scx_bpf_dump("%08x", v);
+}
+
 static void dump_layer_cpumask(int id)
 {
 	struct cpumask *layer_cpumask;
-	s32 cpu;
-	char buf[128] = "", *p;
+	u32 word, nr_words = (nr_cpu_ids + 31) / 32;
 
 	if (!(layer_cpumask = lookup_layer_cpumask(id)))
 		return;
 
-	bpf_for(cpu, 0, scx_bpf_nr_cpu_ids()) {
-		if (!(p = MEMBER_VPTR(buf, [cpu])))
-			break;
-		if (bpf_cpumask_test_cpu(cpu, layer_cpumask))
-			*p = '0' + cpu % 10;
-		else
-			*p = '.';
+	bpf_for(word, 0, nr_words) {
+		if (word)
+			scx_bpf_dump(",");
+		dump_cpumask_word(nr_words - word - 1, layer_cpumask);
 	}
-	buf[sizeof(buf) - 1] = '\0';
-
-	scx_bpf_dump("%s", buf);
 }
 
 void BPF_STRUCT_OPS(layered_dump, struct scx_dump_ctx *dctx)
@@ -2800,24 +2861,24 @@ void BPF_STRUCT_OPS(layered_dump, struct scx_dump_ctx *dctx)
 				continue;
 
 			dsq_id = layer_dsq_id(layer->id, j);
-			scx_bpf_dump("LAYER[%d][%s]DSQ[%llx] nr_cpus=%u nr_queued=%d -%llums cpus=",
+			scx_bpf_dump("LAYER[%d](%s)-DSQ[%llx] nr_cpus=%u nr_queued=%d %+lldms\n",
 				     i, layer->name, dsq_id, layer->nr_cpus,
 				     scx_bpf_dsq_nr_queued(dsq_id),
-				     dsq_first_runnable_for_ms(dsq_id, now));
-			scx_bpf_dump("\n");
+				     dsq_first_runnable_at_ms(dsq_id, now));
 		}
+		scx_bpf_dump("LAYER[%d](%s) CPUS=", i, layer->name);
 		dump_layer_cpumask(i);
 		scx_bpf_dump("\n");
 	}
 	bpf_for(i, 0, nr_llcs) {
 		dsq_id = hi_fb_dsq_id(i);
-		scx_bpf_dump("HI_[%llx] nr_queued=%d -%llums\n",
+		scx_bpf_dump("HI_[%llx] nr_queued=%d %+lldms\n",
 			     dsq_id, scx_bpf_dsq_nr_queued(dsq_id),
-			     dsq_first_runnable_for_ms(dsq_id, now));
+			     dsq_first_runnable_at_ms(dsq_id, now));
 		dsq_id = lo_fb_dsq_id(i);
-		scx_bpf_dump("LO_FALLBACK[%llx] nr_queued=%d -%llums\n",
+		scx_bpf_dump("LO_FALLBACK[%llx] nr_queued=%d %+lldms\n",
 			     dsq_id, scx_bpf_dsq_nr_queued(dsq_id),
-			     dsq_first_runnable_for_ms(dsq_id, now));
+			     dsq_first_runnable_at_ms(dsq_id, now));
 	}
 }
 
@@ -3293,6 +3354,7 @@ SCX_OPS_DEFINE(layered,
 	       .select_cpu		= (void *)layered_select_cpu,
 	       .enqueue			= (void *)layered_enqueue,
 	       .dispatch		= (void *)layered_dispatch,
+	       .tick			= (void *)layered_tick,
 	       .runnable		= (void *)layered_runnable,
 	       .running			= (void *)layered_running,
 	       .stopping		= (void *)layered_stopping,

@@ -21,7 +21,6 @@ struct {
 static __always_inline
 int submit_task_ctx(struct task_struct *p, struct task_ctx *taskc, u32 cpu_id)
 {
-	struct sys_stat *stat_cur = get_sys_stat_cur();
 	struct cpu_ctx *cpuc;
 	struct msg_task_ctx *m;
 
@@ -37,15 +36,16 @@ int submit_task_ctx(struct task_struct *p, struct task_ctx *taskc, u32 cpu_id)
 	m->taskc_x.pid = p->pid;
 	__builtin_memcpy_inline(m->taskc_x.comm, p->comm, TASK_COMM_LEN);
 	m->taskc_x.static_prio = get_nice_prio(p);
-	m->taskc_x.cpu_util = cpuc->util / 10;
+	m->taskc_x.cpu_util = s2p(cpuc->avg_util);
+	m->taskc_x.cpu_sutil = s2p(cpuc->avg_sc_util);
 	m->taskc_x.cpu_id = cpu_id;
-	m->taskc_x.avg_lat_cri = stat_cur->avg_lat_cri;
-	m->taskc_x.thr_perf_cri = stat_cur->thr_perf_cri;
-	m->taskc_x.nr_active = stat_cur->nr_active;
+	m->taskc_x.avg_lat_cri = sys_stat.avg_lat_cri;
+	m->taskc_x.thr_perf_cri = sys_stat.thr_perf_cri;
+	m->taskc_x.nr_active = sys_stat.nr_active;
 	m->taskc_x.cpuperf_cur = cpuc->cpuperf_cur;
 
-	m->taskc_x.stat[0] = is_lat_cri(taskc, stat_cur) ? 'L' : 'R';
-	m->taskc_x.stat[1] = is_perf_cri(taskc, stat_cur) ? 'H' : 'I';
+	m->taskc_x.stat[0] = is_lat_cri(taskc) ? 'L' : 'R';
+	m->taskc_x.stat[1] = is_perf_cri(taskc) ? 'H' : 'I';
 	m->taskc_x.stat[2] = cpuc->big_core ? 'B' : 'T';
 	m->taskc_x.stat[3] = is_greedy(taskc) ? 'G' : 'E';
 	m->taskc_x.stat[4] = '\0';

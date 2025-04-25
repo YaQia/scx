@@ -14,7 +14,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use xdg;
 
 /// `scxtop` can use a configuration file, which can be generated using the `S` key
@@ -327,7 +327,7 @@ mod tests {
 
         assert_eq!(merged.theme(), &AppTheme::MidnightGreen);
         assert_eq!(merged.tick_rate_ms(), 114);
-        assert_eq!(merged.debug(), true);
-        assert_eq!(merged.exclude_bpf(), false);
+        assert!(merged.debug());
+        assert!(!merged.exclude_bpf());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "scx_utils"
-version = "1.0.12"
+version = "1.0.14"
 edition = "2021"
 authors = ["Tejun Heo <tj@kernel.org>"]
 license = "GPL-2.0-only"
@@ -21,14 +21,17 @@ log = "0.4.17"
 nvml-wrapper = { version = "0.10.0", optional = true }
 paste = "1.0"
 regex = "1.11.1"
-scx_stats = { path = "../scx_stats", version = "1.0.10" }
+scx_stats = { path = "../scx_stats", version = "1.0.11" }
 serde = { version = "1.0.215", features = ["derive"] }
 sscanf = "0.4"
 tar = "0.4"
 walkdir = "2.4"
 version-compare = "0.1"
 libc = "0.2.137"
-zbus = { version = "5", optional = true }
+zbus = { version = "5.3.1", optional = true }
+
+[dev-dependencies]
+tempfile = "3.19.1"
 
 [build-dependencies]
 anyhow = "1.0.65"
@@ -46,6 +49,10 @@ walkdir = "2.4"
 default = []
 gpu-topology = ["dep:nvml-wrapper"]
 autopower = ["dep:zbus"]
+
+[[example]]
+name = "mangolog"
+crate-type = ["bin"]
 
 [lints.clippy]
 not_unsafe_ptr_arg_deref = "allow"

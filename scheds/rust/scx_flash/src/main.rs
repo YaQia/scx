@@ -22,9 +22,6 @@ use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::libbpf_sys::bpf_program__set_autoload;
-use libbpf_rs::skel::OpenSkel;
-use libbpf_rs::skel::Skel;
-use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::AsRawLibbpf;
 use libbpf_rs::OpenObject;
 use log::info;
@@ -32,8 +29,6 @@ use log::warn;
 use scx_stats::prelude::*;
 use scx_utils::build_id;
 use scx_utils::compat;
-use scx_utils::import_enums;
-use scx_utils::scx_enums;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
@@ -146,6 +141,15 @@ impl<'a> Scheduler<'a> {
         } else {
             warn!("vfs_fsync_range symbol is missing")
         }
+
+        // Set scheduler flags.
+        skel.struct_ops.flash_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
+            | *compat::SCX_OPS_ENQ_LAST
+            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED;
+        info!(
+            "scheduler flags: {:#x}",
+            skel.struct_ops.flash_ops_mut().flags
+        );
 
         // Load the BPF program for validation.
         let mut skel = scx_ops_load!(skel, flash_ops, uei)?;

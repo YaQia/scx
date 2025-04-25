@@ -1,5 +1,8 @@
+use anyhow::Result;
 use std::collections::BTreeMap;
+use std::fs;
 use std::sync::Arc;
+use walkdir::WalkDir;
 
 use clap::Parser;
 use scx_utils::Core;
@@ -39,12 +42,18 @@ pub enum LayerGrowthAlgo {
     /// LittleBig attempts to first grow across all little cores and then
     /// allocates onto big cores after all little cores are allocated.
     LittleBig,
-    /// Grab CPUs from NUMA nodes, iteratively, in linear order. Not for use
-    /// on CPUs with heterogenous SMT.
+    /// Grab CPUs from NUMA nodes, iteratively, in linear order.
     NodeSpread,
-    /// Grab CPUs from NUMA nodes, iteratively, in reverse order. Not for use
-    /// on CPUs with heterogenous SMT.
+    /// Grab CPUs from NUMA nodes, iteratively, in reverse order.
     NodeSpreadReverse,
+    /// Grab CPUs from NUMA nodes, iteratively, in random order.
+    NodeSpreadRandom,
+    /// Grab CPUs from CpuSets, iteratively, in linear order.
+    CpuSetSpread,
+    /// Grab CPUs from CpuSets, iteratively, in reverse order.
+    CpuSetSpreadReverse,
+    /// Grab CPUs from CpuSets, iteratively, in random order.
+    CpuSetSpreadRandom,
     /// RandomTopo is sticky to NUMA nodes/LLCs but randomises the order in which
     /// it visits each. The layer will select a random NUMA node, then a random LLC
     /// within it, then randomly iterate the cores in that LLC.
@@ -66,9 +75,94 @@ const GROWTH_ALGO_LITTLE_BIG: i32 = bpf_intf::layer_growth_algo_GROWTH_ALGO_LITT
 const GROWTH_ALGO_NODE_SPREAD: i32 = bpf_intf::layer_growth_algo_GROWTH_ALGO_NODE_SPREAD as i32;
 const GROWTH_ALGO_NODE_SPREAD_REVERSE: i32 =
     bpf_intf::layer_growth_algo_GROWTH_ALGO_NODE_SPREAD_REVERSE as i32;
+const GROWTH_ALGO_NODE_SPREAD_RANDOM: i32 =
+    bpf_intf::layer_growth_algo_GROWTH_ALGO_NODE_SPREAD_RANDOM as i32;
+const GROWTH_ALGO_CPUSET_SPREAD: i32 = bpf_intf::layer_growth_algo_GROWTH_ALGO_CPUSET_SPREAD as i32;
+const GROWTH_ALGO_CPUSET_SPREAD_REVERSE: i32 =
+    bpf_intf::layer_growth_algo_GROWTH_ALGO_CPUSET_SPREAD_REVERSE as i32;
+const GROWTH_ALGO_CPUSET_SPREAD_RANDOM: i32 =
+    bpf_intf::layer_growth_algo_GROWTH_ALGO_CPUSET_SPREAD_RANDOM as i32;
 const GROWTH_ALGO_RANDOM_TOPO: i32 = bpf_intf::layer_growth_algo_GROWTH_ALGO_RANDOM_TOPO as i32;
 const GROWTH_ALGO_STICKY_DYNAMIC: i32 =
     bpf_intf::layer_growth_algo_GROWTH_ALGO_STICKY_DYNAMIC as i32;
+use std::collections::BTreeSet;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CpuSet {
+    cpus: BTreeSet<usize>,
+    cores: BTreeSet<usize>,
+}
+
+fn parse_cpu_ranges(s: &str) -> Result<BTreeSet<usize>> {
+    let mut cpus = BTreeSet::new();
+
+    for part in s.trim().split(',') {
+        if let Some((start, end)) = part.split_once('-') {
+            let start: usize = start.parse()?;
+            let end: usize = end.parse()?;
+            cpus.extend(start..=end);
+        } else if let Ok(single) = part.parse() {
+            cpus.insert(single);
+        }
+    }
+
+    Ok(cpus)
+}
+
+fn collect_cpuset_effective() -> Result<BTreeSet<BTreeSet<usize>>> {
+    let mut result = BTreeSet::new();
+
+    for entry in WalkDir::new("/sys/fs/cgroup") {
+        if let Ok(entry) = entry {
+            if entry.file_name() == "cpuset.cpus.effective" {
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    result.insert(parse_cpu_ranges(&content)?);
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+// return cpuset layout.
+fn get_cpusets(topo: &Topology) -> Result<BTreeSet<CpuSet>> {
+    let mut cpusets: BTreeSet<CpuSet> = BTreeSet::new();
+    let cpuset_cpus = collect_cpuset_effective()?;
+    for x in cpuset_cpus {
+        let mut cores = BTreeSet::new();
+        for (_, core) in topo.all_cores.iter() {
+            let mut has_all = true;
+            for (_, cpu) in core.cpus.iter() {
+                has_all &= x.contains(&cpu.id);
+            }
+            if has_all {
+                cores.insert(core.id);
+            }
+        }
+        cpusets.insert(CpuSet { cores, cpus: x });
+    }
+    // XXX -- this enforces the expectation that cpusets are disjoint
+    // think this is a reasonable expectation.
+    let mut overlapping_cpusets = BTreeSet::new();
+    for x in cpusets.iter() {
+        for y in cpusets.iter() {
+            if x != y && !overlapping_cpusets.contains(x) && !overlapping_cpusets.contains(y) {
+                // toss superset if exists, toss one of overlap otherwise.
+                if x.cpus.is_superset(&y.cpus) {
+                    overlapping_cpusets.insert(x.clone());
+                } else if y.cpus.is_superset(&x.cpus) {
+                    overlapping_cpusets.insert(y.clone());
+                } else if !x.cpus.is_disjoint(&y.cpus) {
+                    overlapping_cpusets.insert(x.clone());
+                }
+            }
+        }
+    }
+    cpusets.retain(|x| !overlapping_cpusets.contains(x));
+
+    Ok(cpusets)
+}
 
 impl LayerGrowthAlgo {
     pub fn as_bpf_enum(&self) -> i32 {
@@ -83,6 +177,10 @@ impl LayerGrowthAlgo {
             LayerGrowthAlgo::LittleBig => GROWTH_ALGO_LITTLE_BIG,
             LayerGrowthAlgo::NodeSpread => GROWTH_ALGO_NODE_SPREAD,
             LayerGrowthAlgo::NodeSpreadReverse => GROWTH_ALGO_NODE_SPREAD_REVERSE,
+            LayerGrowthAlgo::NodeSpreadRandom => GROWTH_ALGO_NODE_SPREAD_RANDOM,
+            LayerGrowthAlgo::CpuSetSpread => GROWTH_ALGO_CPUSET_SPREAD,
+            LayerGrowthAlgo::CpuSetSpreadReverse => GROWTH_ALGO_CPUSET_SPREAD_REVERSE,
+            LayerGrowthAlgo::CpuSetSpreadRandom => GROWTH_ALGO_CPUSET_SPREAD_RANDOM,
             LayerGrowthAlgo::RandomTopo => GROWTH_ALGO_RANDOM_TOPO,
             LayerGrowthAlgo::StickyDynamic => GROWTH_ALGO_STICKY_DYNAMIC,
         }
@@ -92,17 +190,17 @@ impl LayerGrowthAlgo {
         cpu_pool: &CpuPool,
         layer_specs: &[LayerSpec],
         topo: &Topology,
-    ) -> BTreeMap<usize, Vec<usize>> {
+    ) -> Result<BTreeMap<usize, Vec<usize>>> {
         let mut core_orders = BTreeMap::new();
 
         for (idx, spec) in layer_specs.iter().enumerate() {
             let layer_growth_algo = spec.kind.common().growth_algo.clone();
             let core_order =
                 layer_growth_algo.layer_core_order(cpu_pool, layer_specs, spec, idx, topo);
-            core_orders.insert(idx, core_order);
+            core_orders.insert(idx, core_order?);
         }
 
-        core_orders
+        Ok(core_orders)
     }
 
     fn layer_core_order(
@@ -112,15 +210,16 @@ impl LayerGrowthAlgo {
         spec: &LayerSpec,
         layer_idx: usize,
         topo: &Topology,
-    ) -> Vec<usize> {
+    ) -> Result<Vec<usize>> {
         let generator = LayerCoreOrderGenerator {
             cpu_pool,
             layer_specs,
             spec,
             layer_idx,
             topo,
+            cpusets: &get_cpusets(&topo)?,
         };
-        match self {
+        Ok(match self {
             LayerGrowthAlgo::Sticky => generator.grow_sticky(),
             LayerGrowthAlgo::Linear => generator.grow_linear(),
             LayerGrowthAlgo::Reverse => generator.grow_reverse(),
@@ -131,9 +230,13 @@ impl LayerGrowthAlgo {
             LayerGrowthAlgo::Topo => generator.grow_topo(),
             LayerGrowthAlgo::NodeSpread => generator.grow_node_spread(),
             LayerGrowthAlgo::NodeSpreadReverse => generator.grow_node_spread_reverse(),
+            LayerGrowthAlgo::NodeSpreadRandom => generator.grow_node_spread_random(),
+            LayerGrowthAlgo::CpuSetSpread => generator.grow_cpuset_spread(),
+            LayerGrowthAlgo::CpuSetSpreadReverse => generator.grow_cpuset_spread_reverse(),
+            LayerGrowthAlgo::CpuSetSpreadRandom => generator.grow_cpuset_spread_random(),
             LayerGrowthAlgo::RandomTopo => generator.grow_random_topo(),
             LayerGrowthAlgo::StickyDynamic => generator.grow_sticky_dynamic(),
-        }
+        })
     }
 }
 
@@ -149,6 +252,7 @@ struct LayerCoreOrderGenerator<'a> {
     spec: &'a LayerSpec,
     layer_idx: usize,
     topo: &'a Topology,
+    cpusets: &'a BTreeSet<CpuSet>,
 }
 
 impl<'a> LayerCoreOrderGenerator<'a> {
@@ -249,7 +353,7 @@ impl<'a> LayerCoreOrderGenerator<'a> {
             .collect()
     }
 
-    fn grow_node_spread(&self) -> Vec<usize> {
+    fn grow_node_spread_inner(&self, make_random: bool) -> Vec<usize> {
         let mut cores: Vec<usize> = Vec::new();
         let mut node_core_vecs: Vec<Vec<usize>> = Vec::new();
         let mut max_node_cpus: usize = 0;
@@ -281,6 +385,12 @@ impl<'a> LayerCoreOrderGenerator<'a> {
             node_core_vecs.push(flat_node_vec.clone());
         }
 
+        if make_random {
+            for mut core_vec in &mut node_core_vecs {
+                fastrand::shuffle(&mut core_vec);
+            }
+        }
+
         for i in 0..=max_node_cpus {
             for sub_vec in node_core_vecs.iter() {
                 if i < sub_vec.len() {
@@ -296,6 +406,57 @@ impl<'a> LayerCoreOrderGenerator<'a> {
         let mut cores = self.grow_node_spread();
         cores.reverse();
         cores
+    }
+
+    fn grow_node_spread(&self) -> Vec<usize> {
+        return self.grow_node_spread_inner(false);
+    }
+
+    fn grow_node_spread_random(&self) -> Vec<usize> {
+        return self.grow_node_spread_inner(true);
+    }
+
+    fn grow_cpuset_spread_inner(&self, make_random: bool) -> Vec<usize> {
+        let mut cores: Vec<usize> = Vec::new();
+        let mut cpuset_core_vecs: Vec<Vec<&usize>> = Vec::new();
+        let mut max_cpuset_cores: usize = 0;
+
+        for cpuset in self.cpusets {
+            max_cpuset_cores = std::cmp::max(cpuset_core_vecs.len(), max_cpuset_cores);
+            let cpuset_core_vec: Vec<&usize> = cpuset.cores.iter().map(|x| x).collect();
+            cpuset_core_vecs.push(cpuset_core_vec);
+        }
+
+        if make_random {
+            for mut core_vec in &mut cpuset_core_vecs {
+                fastrand::shuffle(&mut core_vec);
+            }
+        }
+
+        for i in 0..=max_cpuset_cores {
+            for sub_vec in cpuset_core_vecs.iter() {
+                if i < sub_vec.len() {
+                    cores.push(*sub_vec[i]);
+                }
+            }
+        }
+
+        self.rotate_layer_offset(&mut cores);
+        cores
+    }
+
+    fn grow_cpuset_spread_reverse(&self) -> Vec<usize> {
+        let mut cores = self.grow_cpuset_spread();
+        cores.reverse();
+        cores
+    }
+
+    fn grow_cpuset_spread(&self) -> Vec<usize> {
+        return self.grow_cpuset_spread_inner(false);
+    }
+
+    fn grow_cpuset_spread_random(&self) -> Vec<usize> {
+        return self.grow_cpuset_spread_inner(true);
     }
 
     fn grow_little_big(&self) -> Vec<usize> {

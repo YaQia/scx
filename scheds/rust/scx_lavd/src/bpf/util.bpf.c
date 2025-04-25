@@ -21,8 +21,7 @@ const volatile u64	nr_cpu_ids;	/* maximum CPU IDs */
 static volatile u64	nr_cpus_onln;	/* current number of online CPUs */
 static volatile u64	nr_cpus_big;
 
-struct sys_stat	__sys_stats[2];
-volatile int	__sys_stat_idx;
+struct sys_stat	sys_stat;
 
 /*
  * Options
@@ -84,26 +83,6 @@ struct {
 #define max(X, Y) (((X) < (Y)) ? (Y) : (X))
 #endif
 
-static struct sys_stat *get_sys_stat_cur(void)
-{
-	if (READ_ONCE(__sys_stat_idx) == 0)
-		return &__sys_stats[0];
-	return &__sys_stats[1];
-}
-
-static struct sys_stat *get_sys_stat_next(void)
-{
-	if (READ_ONCE(__sys_stat_idx) == 0)
-		return &__sys_stats[1];
-	return &__sys_stats[0];
-}
-
-static void flip_sys_stat(void)
-{
-	WRITE_ONCE(__sys_stat_idx, __sys_stat_idx ^ 0x1);
-}
-
-
 static u64 sigmoid_u64(u64 v, u64 max)
 {
 	/*
@@ -139,51 +118,26 @@ static u64 rsigmoid_u64(u64 v, u64 max)
 	return (v >= max) ? 0 : max - v;
 }
 
-static struct task_ctx *try_get_task_ctx(struct task_struct *p)
-{
-	return bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
-}
-
 static struct task_ctx *get_task_ctx(struct task_struct *p)
 {
-	struct task_ctx *taskc;
-
-	taskc = try_get_task_ctx(p);
-	if (!taskc)
-		scx_bpf_error("task_ctx lookup failed for %s[%d]",
-			      p->comm, p->pid);
-	return taskc;
-}
-
-static struct cpu_ctx *try_get_cpu_ctx(void)
-{
-	const u32 idx = 0;
-
-	return bpf_map_lookup_elem(&cpu_ctx_stor, &idx);
+	return bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 }
 
 static struct cpu_ctx *get_cpu_ctx(void)
 {
 	const u32 idx = 0;
-	struct cpu_ctx *cpuc;
-
-	cpuc = bpf_map_lookup_elem(&cpu_ctx_stor, &idx);
-	if (!cpuc)
-		scx_bpf_error("cpu_ctx lookup failed for current cpu");
-
-	return cpuc;
+	return bpf_map_lookup_elem(&cpu_ctx_stor, &idx);
 }
 
 static struct cpu_ctx *get_cpu_ctx_id(s32 cpu_id)
 {
 	const u32 idx = 0;
-	struct cpu_ctx *cpuc;
+	return bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu_id);
+}
 
-	cpuc = bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu_id);
-	if (!cpuc)
-		scx_bpf_error("cpu_ctx lookup failed for %d", cpu_id);
-
-	return cpuc;
+static struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p)
+{
+	return get_cpu_ctx_id(scx_bpf_task_cpu(p));
 }
 
 static u32 calc_avg32(u32 old_val, u32 new_val)
@@ -204,6 +158,17 @@ static u64 calc_avg(u64 old_val, u64 new_val)
 	return (old_val - (old_val >> 2)) + (new_val >> 2);
 }
 
+static u64 calc_asym_avg(u64 old_val, u64 new_val)
+{
+	/*
+	 * Increase fast but descrease slowly.
+	 */
+	if (old_val < new_val)
+		return (new_val - (new_val >> 2)) + (old_val >> 2);
+	else
+		return (old_val - (old_val >> 2)) + (new_val >> 2);
+}
+
 static u64 calc_avg_freq(u64 old_freq, u64 interval)
 {
 	u64 new_freq, ewma_freq;
@@ -222,27 +187,19 @@ static bool is_kernel_task(struct task_struct *p)
 	return !!(p->flags & PF_KTHREAD);
 }
 
-static bool is_per_cpu_task(const struct task_struct *p)
+static bool is_kernel_worker(struct task_struct *p)
 {
-	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p))
-		return true;
-
-	return false;
+	return !!(p->flags & (PF_WQ_WORKER | PF_IO_WORKER));
 }
 
-static bool is_affinitized(const struct task_struct *p)
+static bool is_pinned(const struct task_struct *p)
 {
-	return p->nr_cpus_allowed != nr_cpu_ids;
+	return p->nr_cpus_allowed == 1;
 }
 
-static bool have_idle_cpus(const struct cpumask *idle_mask)
+static bool is_lat_cri(struct task_ctx *taskc)
 {
-	return !bpf_cpumask_empty(idle_mask);
-}
-
-static bool is_lat_cri(struct task_ctx *taskc, struct sys_stat *stat_cur)
-{
-	return taskc->lat_cri >= stat_cur->avg_lat_cri;
+	return taskc->lat_cri >= sys_stat.avg_lat_cri;
 }
 
 static bool is_greedy(struct task_ctx *taskc)
@@ -277,11 +234,10 @@ static u16 get_nice_prio(struct task_struct *p)
 
 static bool use_full_cpus(void)
 {
-	struct sys_stat *stat_cur = get_sys_stat_cur();
-	return (stat_cur->nr_active + LAVD_CC_NR_OVRFLW) >= nr_cpus_onln;
+	return sys_stat.nr_active >= nr_cpus_onln;
 }
 
-static u64 pick_any_bit(u64 bitmap, u64 nuance)
+static s64 pick_any_bit(u64 bitmap, u64 nuance)
 {
 	u64 i, pos;
 
