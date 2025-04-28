@@ -2,32 +2,31 @@
 #include <scx/common.bpf.h>
 
 struct load_avg {
-  u64 last_update_time;
-  u64 load_sum;
-  u32 period_contrib;
-  unsigned long load_avg;
+    u64 last_update_time;
+    u64 load_sum;
+    u32 period_contrib;
+    unsigned long load_avg;
 };
 
 struct cpu_load {
-  u32 selecting;
-  u64 weight;
-  u64 last_balance_time;
-  struct task_struct *prev;
-  struct load_avg avg;
+    u32 selecting;
+    u64 weight;
+    u64 last_balance_time;
+    struct task_struct *prev;
+    struct load_avg avg;
 };
 
 struct task_ctx {
-  bool runnable;
-  u64 last_balance_time;
-  u64 running_at;
-  u64 weight;
-  u64 avg_slice;
-  u64 enq_flags;
-  struct load_avg avg;
+    bool runnable;
+    u64 last_balance_time;
+    u64 running_at;
+    u64 weight;
+    u64 enq_flags;
+    struct load_avg avg;
 };
 
 #define for_each_domain(cpu, __sd)                                             \
-  for (__sd = READ_ONCE(scx_bpf_cpu_rq(cpu)->sd); __sd; __sd = __sd->parent)
+    for (__sd = READ_ONCE(scx_bpf_cpu_rq(cpu)->sd); __sd; __sd = __sd->parent)
 
 #define WF_SYNC 0x10          /* Waker goes to sleep after wakeup */
 #define PF_EXITING 0x00000004 /* Getting shut down */
@@ -46,46 +45,57 @@ static const u32 runnable_avg_yN_inv[LOAD_AVG_PERIOD] = {
 #define SCHED_FIXEDPOINT_SHIFT 10
 #define scale_load(w) ((w) << SCHED_FIXEDPOINT_SHIFT)
 #define scale_load_down(w)                                                     \
-  ({                                                                           \
+({                                                                           \
     u64 __w = (w);                                                             \
-                                                                               \
+    								       \
     if (__w)                                                                   \
-      __w = 2UL > __w >> SCHED_FIXEDPOINT_SHIFT                                \
-                ? 2UL                                                          \
-                : __w >> SCHED_FIXEDPOINT_SHIFT;                               \
+    __w = 2UL > __w >> SCHED_FIXEDPOINT_SHIFT                                \
+    	? 2UL                                                          \
+    	: __w >> SCHED_FIXEDPOINT_SHIFT;                               \
     __w;                                                                       \
-  })
+})
 
 static __always_inline u64 mul_u64_u32_shr(u64 a, u32 mul, u32 shift) {
-  return (u64)((a * mul) >> shift);
+    return (u64)((a * mul) >> shift);
 }
 
 #define PELT_MIN_DIVIDER (LOAD_AVG_MAX - 1024)
 
 static inline u32 get_pelt_divider(struct load_avg *avg) {
-  return PELT_MIN_DIVIDER + avg->period_contrib;
+    return PELT_MIN_DIVIDER + avg->period_contrib;
 }
 
 static inline u64 se_weight(struct sched_entity *se) {
-  return scale_load_down(se->load.weight);
+    return scale_load_down(se->load.weight);
 }
 
 static inline u64 p_weight(struct task_struct *p) {
-  return scale_load_down(p->se.load.weight);
+    return scale_load_down(p->se.load.weight);
 }
 #define DO_ATTACH 0x4
 #define DO_DETACH 0x8
 
-#define sub_positive(_ptr, _val)                                               \
-  do {                                                                         \
+#define sub_positive_atomic(_ptr, _val)                                               \
+do {                                                                         \
     typeof(_ptr) ptr = (_ptr);                                                 \
     typeof(*ptr) val = (_val);                                                 \
     typeof(*ptr) res, var = __sync_fetch_and_sub(ptr, val);                    \
     res = var - val;                                                           \
     if (res > var) {                                                           \
-      __sync_fetch_and_add(ptr, -res);                                         \
+        __sync_fetch_and_add(ptr, -res);                                         \
     }                                                                          \
-  } while (0)
+} while (0)
+
+#define sub_positive(_ptr, _val) do {				\
+	typeof(_ptr) ptr = (_ptr);				\
+	typeof(*ptr) val = (_val);				\
+	typeof(*ptr) res, var = READ_ONCE(*ptr);		\
+	res = var - val;					\
+	if (res > var)						\
+		res = 0;					\
+	WRITE_ONCE(*ptr, res);					\
+} while (0)
+
 #define DEQUEUE_SLEEP 0x01   /* Matches ENQUEUE_WAKEUP */
 #define DEQUEUE_SAVE 0x02    /* Matches ENQUEUE_RESTORE */
 #define DEQUEUE_MOVE 0x04    /* Matches ENQUEUE_MOVE */
@@ -132,38 +142,38 @@ static inline u64 p_weight(struct task_struct *p) {
 #define MAX_CPU_NR 8192
 
 static inline int task_on_rq_migrating(struct task_struct *p) {
-  return READ_ONCE(p->on_rq) == TASK_ON_RQ_MIGRATING;
+    return READ_ONCE(p->on_rq) == TASK_ON_RQ_MIGRATING;
 }
 
 #define ENQUEUE_MIGRATED 0x40
 
 static inline bool task_is_runnable(struct task_struct *p) {
-  return p->on_rq && !p->se.sched_delayed;
+    return p->on_rq && !p->se.sched_delayed;
 }
 
 #define entity_is_task(se) (!se->my_q)
 
 static inline long se_runnable(struct sched_entity *se) {
-  if (se->sched_delayed)
-    return false;
-
-  if (entity_is_task(se))
-    return !!se->on_rq;
-  else
-    return se->runnable_weight;
+    if (se->sched_delayed)
+        return false;
+    
+    if (entity_is_task(se))
+        return !!se->on_rq;
+    else
+        return se->runnable_weight;
 }
 
 int idle_cpu(int cpu) {
-  struct rq *rq = scx_bpf_cpu_rq(cpu);
+    struct rq *rq = scx_bpf_cpu_rq(cpu);
 
-  if (rq->curr != rq->idle)
-    return 0;
+    if (rq->curr != rq->idle)
+        return 0;
 
-  if (rq->nr_running)
-    return 0;
+    if (rq->nr_running)
+        return 0;
 
-  if (rq->ttwu_pending)
-    return 0;
+    if (rq->ttwu_pending)
+        return 0;
 
-  return 1;
+    return 1;
 }

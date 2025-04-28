@@ -20,10 +20,10 @@ struct {
 } percpu_load SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, int);
-	__type(value, struct task_ctx);
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct task_ctx);
 } task_ctx SEC(".maps");
 
 struct {
@@ -35,142 +35,142 @@ struct {
 
 static u64 decay_load(u64 val, u64 n)
 {
-	u32 local_n;
- 
-	if (unlikely(n > LOAD_AVG_PERIOD * 63))                              /* 1 */
-		return 0;
- 
-	/* after bounds checking we can collapse to 32-bit */
-	local_n = (u32)n;
- 
-	/*
-	 * As y^PERIOD = 1/2, we can combine
-	 *    y^n = 1/2^(n/PERIOD) * y^(n%PERIOD)
-	 * With a look-up table which covers y^n (n<PERIOD)
-	 *
-	 * To achieve constant time decay_load.
-	 */
-	if (unlikely(local_n >= LOAD_AVG_PERIOD)) {                           /* 2 */
-		val >>= local_n / LOAD_AVG_PERIOD;
-	}
+    u32 local_n;
+    
+    if (unlikely(n > LOAD_AVG_PERIOD * 63))                              /* 1 */
+        return 0;
+    
+    /* after bounds checking we can collapse to 32-bit */
+    local_n = (u32)n;
+    
+    /*
+     * As y^PERIOD = 1/2, we can combine
+     *    y^n = 1/2^(n/PERIOD) * y^(n%PERIOD)
+     * With a look-up table which covers y^n (n<PERIOD)
+     *
+     * To achieve constant time decay_load.
+     */
+    if (unlikely(local_n >= LOAD_AVG_PERIOD)) {                           /* 2 */
+        val >>= local_n / LOAD_AVG_PERIOD;
+    }
     local_n %= LOAD_AVG_PERIOD;
  
-	val = mul_u64_u32_shr(val, runnable_avg_yN_inv[local_n], 32);         /* 2 */
-	return val;
+    val = mul_u64_u32_shr(val, runnable_avg_yN_inv[local_n], 32);         /* 2 */
+    return val;
 }
 
 static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
 {
-	u32 c1, c2, c3 = d3; /* y^0 == 1 */
-
-	/*
-	 * c1 = d1 y^p
-	 */
-	c1 = decay_load((u64)d1, periods);
-
-	/*
-	 *            p-1
-	 * c2 = 1024 \Sum y^n
-	 *            n=1
-	 *
-	 *              inf        inf
-	 *    = 1024 ( \Sum y^n - \Sum y^n - y^0 )
-	 *              n=0        n=p
-	 */
-	c2 = LOAD_AVG_MAX - decay_load(LOAD_AVG_MAX, periods) - 1024;
-
-	return c1 + c2 + c3;
+    u32 c1, c2, c3 = d3; /* y^0 == 1 */
+    
+    /*
+     * c1 = d1 y^p
+     */
+    c1 = decay_load((u64)d1, periods);
+    
+    /*
+     *            p-1
+     * c2 = 1024 \Sum y^n
+     *            n=1
+     *
+     *              inf        inf
+     *    = 1024 ( \Sum y^n - \Sum y^n - y^0 )
+     *              n=0        n=p
+     */
+    c2 = LOAD_AVG_MAX - decay_load(LOAD_AVG_MAX, periods) - 1024;
+    
+    return c1 + c2 + c3;
 }
 
 static __always_inline u32
 accumulate_sum(u64 delta, struct load_avg *la, u64 load)
 {
-	u32 contrib = (u32)delta; /* p == 0 -> delta < 1024 */
-	u64 periods;
-
-	delta += la->period_contrib;
-
-	periods = delta / 1024; /* A period is 1024us (~1ms) */
-	/*
-	 * Step 1: decay old *_sum if we crossed period boundaries.
-	 */
-	if (periods) {
-		la->load_sum = decay_load(la->load_sum, periods);
-
-		/*
-		 * Step 2
-		 */
-		delta %= 1024;
-		if (load) {
-			/*
-			 * This relies on the:
-			 *
-			 * if (!load)
-			 *	runnable = running = 0;
-			 *
-			 * clause from ___update_load_sum(); this results in
-			 * the below usage of @contrib to disappear entirely,
-			 * so no point in calculating it.
-			 */
-			contrib = __accumulate_pelt_segments(periods,
-					1024 - la->period_contrib, delta);
-		}
-	}
-	la->period_contrib = delta;
-
-	if (load)
-		la->load_sum += load * contrib;
-
-	return periods;
+    u32 contrib = (u32)delta; /* p == 0 -> delta < 1024 */
+    u64 periods;
+    
+    delta += la->period_contrib;
+    
+    periods = delta / 1024; /* A period is 1024us (~1ms) */
+    /*
+     * Step 1: decay old *_sum if we crossed period boundaries.
+     */
+    if (periods) {
+        la->load_sum = decay_load(la->load_sum, periods);
+        
+        /*
+         * Step 2
+         */
+        delta %= 1024;
+        if (load) {
+            /*
+             * This relies on the:
+             *
+             * if (!load)
+             *	runnable = running = 0;
+             *
+             * clause from ___update_load_sum(); this results in
+             * the below usage of @contrib to disappear entirely,
+             * so no point in calculating it.
+             */
+            contrib = __accumulate_pelt_segments(periods,
+                      1024 - la->period_contrib, delta);
+        }
+    }
+    la->period_contrib = delta;
+    
+    if (load)
+        la->load_sum += load * contrib;
+    
+    return periods;
 }
 
 static __always_inline s32
 ___update_load_sum(u64 now, struct load_avg *la, u64 load)
 {
-	u64 delta;
-
-	delta = now - la->last_update_time;
-	/*
-	 * This should only happen when time goes backwards, which it
-	 * unfortunately does during sched clock init when we swap over to TSC.
-	 */
-	if ((s64)delta < 0) {
-		la->last_update_time = now;
-		return 0;
-	}
-
-	/*
-	 * Use 1024ns as the unit of measurement since it's a reasonable
-	 * approximation of 1us and fast to compute.
-	 */
-	delta >>= 10;
-	if (!delta)
-		return 0;
-
-	la->last_update_time += delta << 10;
-
-	/*
-	 * Now we know we crossed measurement unit boundaries. The *_avg
-	 * accrues by two steps:
-	 *
-	 * Step 1: accumulate *_sum since last_update_time. If we haven't
-	 * crossed period boundaries, finish.
-	 */
-	if (!accumulate_sum(delta, la, load))
-		return 0;
-
-	return 1;
+    u64 delta;
+    
+    delta = now - la->last_update_time;
+    /*
+     * This should only happen when time goes backwards, which it
+     * unfortunately does during sched clock init when we swap over to TSC.
+     */
+    if ((s64)delta < 0) {
+        la->last_update_time = now;
+        return 0;
+    }
+    
+    /*
+     * Use 1024ns as the unit of measurement since it's a reasonable
+     * approximation of 1us and fast to compute.
+     */
+    delta >>= 10;
+    if (!delta)
+        return 0;
+    
+    la->last_update_time += delta << 10;
+    
+    /*
+     * Now we know we crossed measurement unit boundaries. The *_avg
+     * accrues by two steps:
+     *
+     * Step 1: accumulate *_sum since last_update_time. If we haven't
+     * crossed period boundaries, finish.
+     */
+    if (!accumulate_sum(delta, la, load))
+        return 0;
+    
+    return 1;
 }
 
 static __always_inline void
 ___update_load_avg(struct load_avg *la, unsigned long load)
 {
-	u32 divider = get_pelt_divider(la);
-
-	/*
-	 * Step 2: update *_avg.
-	 */
-	la->load_avg = (load * la->load_sum) / divider;
+    u32 divider = get_pelt_divider(la);
+    
+    /*
+     * Step 2: update *_avg.
+     */
+    la->load_avg = (load * la->load_sum) / divider;
 }
 
 int __update_load_avg_p(u64 now, struct task_ctx *p_ctx)
@@ -178,11 +178,11 @@ int __update_load_avg_p(u64 now, struct task_ctx *p_ctx)
     if (unlikely(!p_ctx)) {
         return 0;
     }
-	if (___update_load_sum(now, &p_ctx->avg, p_ctx->runnable)) {
-		___update_load_avg(&p_ctx->avg, p_ctx->weight);
-		return 1;
-	}
-	return 0;
+    if (___update_load_sum(now, &p_ctx->avg, p_ctx->runnable)) {
+        ___update_load_avg(&p_ctx->avg, p_ctx->weight);
+        return 1;
+    }
+    return 0;
 }
 
 int __update_load_avg_cpu(u64 now, struct cpu_load *cpu_load)
@@ -190,61 +190,61 @@ int __update_load_avg_cpu(u64 now, struct cpu_load *cpu_load)
     if (unlikely(!cpu_load)) {
         return 0;
     }
-	if (___update_load_sum(now, &cpu_load->avg, cpu_load->weight)) {
-		___update_load_avg(&cpu_load->avg, 1);
-		return 1;
-	}
-
-	return 0;
+    if (___update_load_sum(now, &cpu_load->avg, cpu_load->weight)) {
+        ___update_load_avg(&cpu_load->avg, 1);
+        return 1;
+    }
+    
+    return 0;
 }
 
 static inline void
 enqueue_load_avg(struct cpu_load *cpu_load, struct task_ctx *p_ctx)
 {
-	cpu_load->avg.load_avg += p_ctx->avg.load_avg;
-	cpu_load->avg.load_sum += p_ctx->weight * p_ctx->avg.load_sum;
+    cpu_load->avg.load_avg += p_ctx->avg.load_avg;
+    cpu_load->avg.load_sum += p_ctx->weight * p_ctx->avg.load_sum;
 }
 
 static inline void
 dequeue_load_avg(struct cpu_load *cpu_load, struct task_ctx *p_ctx)
 {
-	sub_positive(&cpu_load->avg.load_avg, p_ctx->avg.load_avg);
-	sub_positive(&cpu_load->avg.load_sum, p_ctx->weight * p_ctx->avg.load_sum);
-	/* See update_cfs_rq_load_avg() */
-	cpu_load->avg.load_sum = cpu_load->avg.load_sum >= cpu_load->avg.load_avg * PELT_MIN_DIVIDER 
-                       ? cpu_load->avg.load_sum : cpu_load->avg.load_avg * PELT_MIN_DIVIDER;
+    sub_positive(&cpu_load->avg.load_avg, p_ctx->avg.load_avg);
+    sub_positive(&cpu_load->avg.load_sum, p_ctx->weight * p_ctx->avg.load_sum);
+    /* See update_cfs_rq_load_avg() */
+    cpu_load->avg.load_sum = cpu_load->avg.load_sum >= cpu_load->avg.load_avg * PELT_MIN_DIVIDER 
+                           ? cpu_load->avg.load_sum : cpu_load->avg.load_avg * PELT_MIN_DIVIDER;
 }
 
 static void attach_entity_load_avg(struct cpu_load *cpu_load, struct task_ctx *p_ctx)
 {
-	/*
-	 * cfs_rq->avg.period_contrib can be used for both cfs_rq and se.
-	 * See ___update_load_avg() for details.
-	 */
-	u32 divider = get_pelt_divider(&cpu_load->avg);
-
-	/*
-	 * When we attach the @se to the @cfs_rq, we must align the decay
-	 * window because without that, really weird and wonderful things can
-	 * happen.
-	 *
-	 * XXX illustrate
-	 */
-	p_ctx->avg.last_update_time = cpu_load->avg.last_update_time;
-	p_ctx->avg.period_contrib = cpu_load->avg.period_contrib;
-
-	p_ctx->avg.load_sum = p_ctx->avg.load_avg * divider;
-	if (p_ctx->weight < p_ctx->avg.load_sum)
-		p_ctx->avg.load_sum = p_ctx->avg.load_sum / p_ctx->weight;
-	else
-		p_ctx->avg.load_sum = 1;
-
-	enqueue_load_avg(cpu_load, p_ctx);
+    /*
+     * cfs_rq->avg.period_contrib can be used for both cfs_rq and se.
+     * See ___update_load_avg() for details.
+     */
+    u32 divider = get_pelt_divider(&cpu_load->avg);
+    
+    /*
+     * When we attach the @se to the @cfs_rq, we must align the decay
+     * window because without that, really weird and wonderful things can
+     * happen.
+     *
+     * XXX illustrate
+     */
+    p_ctx->avg.last_update_time = cpu_load->avg.last_update_time;
+    p_ctx->avg.period_contrib = cpu_load->avg.period_contrib;
+    
+    p_ctx->avg.load_sum = p_ctx->avg.load_avg * divider;
+    if (p_ctx->weight < p_ctx->avg.load_sum)
+        p_ctx->avg.load_sum = p_ctx->avg.load_sum / p_ctx->weight;
+    else
+        p_ctx->avg.load_sum = 1;
+    
+    enqueue_load_avg(cpu_load, p_ctx);
 }
 
 static void detach_entity_load_avg(struct cpu_load *cpu_load, struct task_ctx *p_load)
 {
-	dequeue_load_avg(cpu_load, p_load);
+    dequeue_load_avg(cpu_load, p_load);
     // reset last_update_time here.
     p_load->avg.last_update_time = 0;
 }
@@ -264,12 +264,12 @@ static inline void update_load_avg(struct cpu_load *cpu_load, struct task_ctx *p
     __update_load_avg_cpu(now, cpu_load);
     if (!p_ctx->avg.last_update_time && (flags & DO_ATTACH)) {
         /*
-		 * DO_ATTACH means we're here from enqueue_task_scx().
-		 * !last_update_time means the task been detached or
+	     * DO_ATTACH means we're here from enqueue_task_scx().
+	     * !last_update_time means the task been detached or
          * is not runnable before.
-		 *
-		 * IOW we're enqueueing a task on a new CPU.
-		 */
+	     *
+	     * IOW we're enqueueing a task on a new CPU.
+	     */
         attach_entity_load_avg(cpu_load, p_ctx);
     } else if (flags & DO_DETACH) {
         detach_entity_load_avg(cpu_load, p_ctx);
@@ -283,7 +283,7 @@ static inline bool vtime_before(u64 a, u64 b)
 
 static s32 get_affine_cpu(struct task_struct *p, s32 prev_cpu, bool *idle, u64 wake_flags)
 {
-    const s32 this_cpu = bpf_get_smp_processor_id();
+    s32 this_cpu = bpf_get_smp_processor_id();
     s32 cpu = this_cpu;
     *idle = false;
     if (wake_flags & WF_TTWU && (wake_flags & WF_CURRENT_CPU) &&
@@ -330,6 +330,15 @@ static s32 get_affine_cpu(struct task_struct *p, s32 prev_cpu, bool *idle, u64 w
     cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
     if (cpu >= 0) {
         goto has_idle;
+    }
+    if (!bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr)) {
+        this_cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+    }
+    if (unlikely(!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))) {
+        prev_cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+    }
+    if (unlikely(this_cpu == prev_cpu)) {
+        return this_cpu;
     }
     // Need some SMT logic here.
     // The test VM has no SMT, so it should be fine.
@@ -458,7 +467,7 @@ void BPF_STRUCT_OPS(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     if (task_on_rq_migrating(p)) {
         update_load_avg(cpu_load, p_ctx, DO_ATTACH);
         __sync_fetch_and_add(&cpu_load->weight, p_ctx->weight);
-
+        p_ctx->runnable = true;
         u64 *cpu_vtime_now = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
         if (unlikely(!cpu_vtime_now)) {
             scx_bpf_error("target CPU's vtime_now can not be referenced.");
@@ -494,7 +503,8 @@ void BPF_STRUCT_OPS(eevdf_dequeue, struct task_struct *p, u64 deq_flags)
     }
     if (task_on_rq_migrating(p)) {
         update_load_avg(cpu_load, p_ctx, DO_DETACH);
-        sub_positive(&cpu_load->weight, p_ctx->weight);
+        sub_positive_atomic(&cpu_load->weight, p_ctx->weight);
+        p_ctx->runnable = false;
         u64 *cpu_vtime_now = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
         if (unlikely(!cpu_vtime_now)) {
             scx_bpf_error("target CPU's vtime_now can not be referenced.");
@@ -638,7 +648,7 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
         // task is still hot
         if ((target_load->prev == p/*  && now - p_ctx->last_balance_time < BALANCE_PREV_INTERVAL_NS */)
             || target_eff_load < this_eff_load
-            || p_ctx->avg.load_avg < LC_APP_LOAD_THRESH) {
+            /* || p_ctx->avg.load_avg < LC_APP_LOAD_THRESH */) {
             continue;
         }
         if (unlikely(!__COMPAT_scx_bpf_dsq_move(&iter, p, SCX_DSQ_LOCAL_ON | cpu, p_ctx->enq_flags)))
@@ -655,7 +665,10 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
 
         u64 vtime = p->scx.dsq_vtime;
         sub_positive(&vtime, *vtime_now_prev);
-        vtime += *vtime_now_curr - DEFAULT_SLICE_NS;
+        if (p_ctx->avg.load_avg < LC_APP_LOAD_THRESH)
+            vtime += *vtime_now_curr - DEFAULT_SLICE_NS;
+        else
+            vtime += *vtime_now_curr;
         p->scx.dsq_vtime = vtime;
         update_load_avg(target_load, p_ctx, DO_DETACH);
         sub_positive(&target_load->weight, p_ctx->weight);
@@ -722,7 +735,7 @@ void BPF_STRUCT_OPS(eevdf_running, struct task_struct *p)
         return ;
     }
     if (vtime_before(*vtime_now_local, p->scx.dsq_vtime))
-        *vtime_now_local = p->scx.dsq_vtime;
+        __sync_lock_test_and_set(vtime_now_local, p->scx.dsq_vtime);
     struct task_ctx *p_ctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if (!p_ctx) {
         scx_bpf_error("task_ctx can not be referenced.");
@@ -781,7 +794,7 @@ void BPF_STRUCT_OPS(eevdf_quiescent, struct task_struct *p, u64 deq_flags)
     }
     // IMPORTANT: Don't detach it! Slept task should not be detached at all!
     update_load_avg(cpu_load, p_ctx, 0);
-    sub_positive(&cpu_load->weight, p_ctx->weight);
+    sub_positive_atomic(&cpu_load->weight, p_ctx->weight);
     u64 *cpu_vtime_now = bpf_map_lookup_percpu_elem(&vtime_now, &idx, cpu);
     if (unlikely(!cpu_vtime_now)) {
         scx_bpf_error("target CPU's vtime_now can not be referenced.");
@@ -810,7 +823,7 @@ void BPF_STRUCT_OPS(eevdf_set_weight, struct task_struct *p, u32 weight)
         return ;
     }
     update_load_avg(cpu_load, p_ctx, 0);
-    sub_positive(&cpu_load->weight, p_ctx->weight);
+    sub_positive_atomic(&cpu_load->weight, p_ctx->weight);
     dequeue_load_avg(cpu_load, p_ctx);
     p_ctx->weight = weight;
     enqueue_load_avg(cpu_load, p_ctx);
@@ -866,13 +879,18 @@ void BPF_STRUCT_OPS(eevdf_exit_task, struct task_struct *p, struct scx_exit_task
     if (unlikely(!p_ctx)) {
         return ;
     }
+    // this might be impossible
+    if (unlikely(p_ctx->runnable)) {
+        sub_positive_atomic(&cpu_load->weight, p_ctx->weight);
+    }
     // if (unlikely(p_ctx->avg.last_update_time != 0)) {
     //     update_load_avg(cpu_load, p_ctx, DO_DETACH);
     //     sub_positive(&cpu_load->weight, p_ctx->weight);
     // }
-    // if (unlikely(cpu_load->weight > 0 && scx_bpf_cpu_rq(cpu)->scx.nr_running == 0)) {
-    //     __sync_lock_test_and_set(&cpu_load->weight, 0);
-    // }
+    if (unlikely(cpu_load->weight > 0 && scx_bpf_cpu_rq(cpu)->scx.nr_running == 0)) {
+        // scx_bpf_error("%s[%d] can not maintain weight correctly.", p->comm, p->pid);
+        __sync_lock_test_and_set(&cpu_load->weight, 0);
+    }
     // IMPORTANT: we have to delete the task_ctx here,
     // or ops.dispatch will get exited tasks to dispatch.
     bpf_task_storage_delete(&task_ctx, p);
@@ -893,6 +911,17 @@ void BPF_STRUCT_OPS(eevdf_tick, struct task_struct *p)
         return ;
     }
     update_load_avg(cpu_load, p_ctx, 0);
+
+    u64 duration = scx_bpf_now() - p_ctx->running_at;
+    p_ctx->running_at += duration;
+    p->scx.dsq_vtime += duration * 100 / p->scx.weight;
+    u64 *vtime_now_local = bpf_map_lookup_elem(&vtime_now, &idx);
+    if (unlikely(!vtime_now_local)) {
+	    scx_bpf_error("vimte_now_local can not be referenced.");
+	    return ;
+    }
+    if (likely(vtime_before(*vtime_now_local, p->scx.dsq_vtime)))
+	    __sync_lock_test_and_set(vtime_now_local, p->scx.dsq_vtime);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(eevdf_init)
@@ -947,7 +976,7 @@ SCX_OPS_DEFINE(eevdf_ops,
            .tick            = (void *)eevdf_tick,
            .init            = (void *)eevdf_init,
            .exit            = (void *)eevdf_exit,
-           // .root_cgroup_path = "/",
+           .root_cgroup_path = "/tailbench.slice",
            .name            = "eevdf");
 
     // cpu = bpf_cpumask_any_distribute(p->cpus_ptr);

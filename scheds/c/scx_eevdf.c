@@ -59,7 +59,7 @@ restart:
 		if (ret < 0)
 		    continue;
 		for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
-		    printf("CPU %d:\tload_avg = %ld\tweight = %ld\n", cpu, loads[cpu].avg.load_avg, loads[cpu].weight);
+		    printf("CPU %d:\tload_avg = %ld\tweight = %ld\tvtime = %lu\n", cpu, loads[cpu].avg.load_avg, loads[cpu].weight, vtimes[cpu]);
 		}
 		fflush(stdout);
 		sleep(1);

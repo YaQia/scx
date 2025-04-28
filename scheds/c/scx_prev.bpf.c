@@ -66,5 +66,6 @@ void BPF_STRUCT_OPS(prev_exit, struct scx_exit_info *ei)
 SCX_OPS_DEFINE(prev_ops,
 	.select_cpu		= (void *)prev_select_cpu,
 	.exit			= (void *)prev_exit,
+	.root_cgroup_path	= "/deathstarbench.slice",
 	.name			= "prev"
 );
