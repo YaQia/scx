@@ -301,16 +301,19 @@ static s32 get_affine_cpu(struct task_struct *p, s32 prev_cpu, bool *idle, u64 w
         goto has_idle;
     }
     const struct rq *this_rq = scx_bpf_cpu_rq(this_cpu);
-    if (!this_rq) {
-        scx_bpf_put_cpumask(idle_cpumask);
-        scx_bpf_error("can not get rq.");
-        return -1;
-    }
-    const struct task_struct *current = this_rq->curr;
-    if (!current) {
-        scx_bpf_put_cpumask(idle_cpumask);
-        scx_bpf_error("current is NULL (impossible).");
-        return -1;
+    if (unlikely(!this_rq)) {
+        if (bpf_cpumask_test_cpu(prev_cpu, idle_cpumask)) {
+            scx_bpf_put_cpumask(idle_cpumask);
+            cpu = prev_cpu;
+            goto has_idle;
+        } else if ((cpu = bpf_cpumask_any_distribute(idle_cpumask)) < nr_cpu_ids) {
+            scx_bpf_put_cpumask(idle_cpumask);
+            goto has_idle;
+        } else {
+            scx_bpf_put_cpumask(idle_cpumask);
+            cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+            goto has_cpu;
+        }
     }
     // Current rq only has waker running
     if (bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr)
@@ -342,7 +345,7 @@ static s32 get_affine_cpu(struct task_struct *p, s32 prev_cpu, bool *idle, u64 w
     }
     // Need some SMT logic here.
     // The test VM has no SMT, so it should be fine.
-    const struct task_ctx *p_ctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    const struct task_ctx *p_ctx = bpf_task_storage_get(&task_ctx, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (unlikely(!p_ctx)) {
         scx_bpf_error("task load can not be referenced.");
         return -1;
@@ -435,6 +438,8 @@ static s32 get_affine_cpu(struct task_struct *p, s32 prev_cpu, bool *idle, u64 w
     }
 has_idle:
     *idle = true;
+    return cpu;
+has_cpu:
     return cpu;
 }
 
@@ -642,12 +647,12 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
             bpf_iter_scx_dsq_destroy(&iter);
             return ;
         }
-        const u64 p_load_avg = p_ctx->avg.load_avg;
-        const u64 target_eff_load = (target_load->avg.load_avg - p_load_avg) * target_rq->cpu_capacity;
-        const u64 this_eff_load = (this_load->avg.load_avg + p_load_avg) * this_rq->cpu_capacity;
+        // const u64 p_load_avg = p_ctx->avg.load_avg;
+        // const u64 target_eff_load = (target_load->avg.load_avg - p_load_avg) * target_rq->cpu_capacity;
+        // const u64 this_eff_load = (this_load->avg.load_avg + p_load_avg) * this_rq->cpu_capacity;
         // task is still hot
-        if ((target_load->prev == p/*  && now - p_ctx->last_balance_time < BALANCE_PREV_INTERVAL_NS */)
-            || target_eff_load < this_eff_load
+        if ((target_load->prev == p && now - p_ctx->last_balance_time < BALANCE_PREV_INTERVAL_NS)
+            // || target_eff_load < this_eff_load
             /* || p_ctx->avg.load_avg < LC_APP_LOAD_THRESH */) {
             continue;
         }
@@ -686,7 +691,7 @@ void BPF_STRUCT_OPS(eevdf_dispatch, s32 cpu, struct task_struct *prev)
     __sync_lock_test_and_set(&max_load->selecting, 0);
 run_prev_again:
     if (prev && prev->scx.flags & SCX_TASK_QUEUED) {
-        prev->scx.slice = now - this_load->last_balance_time;
+        prev->scx.slice = now - this_load->last_balance_time > 0 ? now - this_load->last_balance_time : 1;
     }
 }
 
@@ -700,7 +705,7 @@ void BPF_STRUCT_OPS(eevdf_runnable, struct task_struct *p, u64 enq_flags)
         scx_bpf_error("can not get cpu load.");
         return ;
     }
-    struct task_ctx *p_ctx = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    struct task_ctx *p_ctx = bpf_task_storage_get(&task_ctx, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (unlikely(!p_ctx)) {
         scx_bpf_error("[runnable]: can not get task load.");
         return ;
@@ -859,9 +864,9 @@ s32 BPF_STRUCT_OPS(eevdf_init_task, struct task_struct *p, struct scx_init_task_
     // } else {
     //     *p_ctx = *pp_ctx;
     // }
-    p_ctx->runnable = false;
-    p_ctx->avg.last_update_time = 0;
-    p_ctx->last_balance_time = 0;
+    // p_ctx->runnable = false;
+    // p_ctx->avg.last_update_time = 0;
+    // p_ctx->last_balance_time = 0;
     return 0;
 }
 
